@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Подать заявку - Клан BENZ</title>
+    <link rel="stylesheet" href="/static/application.css">
+</head>
+<body>
+    <header>
+        <div class="header-top">
+            <div class="header-buttons">
+                <a href="/zayavka" class="header-btn">Подать заявку</a>
+                <a href="/admin" class="header-btn admin">Войти в админку</a>
+            </div>
+        </div>
+        <div class="container">
+            <h1>Подать заявку в клан BENZ</h1>
+            <a href="/" class="back-btn">← Назад на главную</a>
+        </div>
+    </header>
+
+    <section class="section">
+        <div class="container">
+            <div class="info">
+                <strong>Требования:</strong> 1500+ часов в игре | <strong>Ограничение:</strong> 1 заявка в час
+            </div>
+
+            <div class="form-card" id="applicationForm">
+                <form id="clanApplicationForm">
+                    <div class="form-group">
+                        <label for="nickname">Игровой никнейм *</label>
+                        <input type="text" id="nickname" name="nickname" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="steamId">Steam ID или профиль *</label>
+                        <input type="text" id="steamId" name="steam_id" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="playtime">Часов в игре * (минимум 1500 часов)</label>
+                        <input type="number" id="playtime" name="playtime" required min="1500">
+                    </div>
+                    <div class="form-group">
+                        <label for="discord">Discord username *</label>
+                        <input type="text" id="discord" name="discord" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="role">Предпочитаемая роль в клане *</label>
+                        <select id="role" name="role" required>
+                            <option value="">Выберите роль</option>
+                            <option value="Фермер">Фермер ресурсов</option>
+                            <option value="Строитель">Строитель баз</option>
+                            <option value="Боец">Комбатер</option>
+                            <option value="Коллер">Коллер</option>
+                            <option value="Универсал">Универсал</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="message">Почему вы хотите вступить в наш клан? *</label>
+                        <textarea id="message" name="message" rows="4" required
+                            placeholder="Расскажите о себе, вашем опыте и почему мы должны принять вас в клан..."></textarea>
+                    </div>
+                    <button type="submit" id="submitBtn">Отправить заявку</button>
+                </form>
+            </div>
+
+            <div class="success-card" id="successMessage">
+                <h3>Заявка отправлена!</h3>
+                <p>Спасибо за вашу заявку в клан BENZ! Мы рассмотрим её в ближайшее время и свяжемся с вами через Discord.</p>
+                <a href="/" class="back-btn" style="margin-top: 1rem;">Вернуться на главную</a>
+            </div>
+        </div>
+    </section>
+
+    <script src="/static/application.js"></script>
+</body>
+</html>

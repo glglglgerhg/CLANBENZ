@@ -10,6 +10,11 @@ import secrets
 import os
 import time
 
+# Пути к шаблонам и статике
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+
 # Настройка логирования с поддержкой Unicode
 logging.basicConfig(
     level=logging.INFO,
@@ -101,6 +106,25 @@ def save_maintenance_mode(enabled):
 def get_maintenance_status():
     """Получение статуса режима обслуживания"""
     return MAINTENANCE_MODE
+
+
+# ==================== ШАБЛОНЫ И СТАТИКА ====================
+
+def read_template(template_name):
+    """Загрузка HTML шаблона из папки templates."""
+    template_path = os.path.join(TEMPLATES_DIR, template_name)
+    with open(template_path, 'r', encoding='utf-8') as file:
+        return file.read()
+
+
+def get_static_file_path(request_path):
+    """Безопасно получить путь к статическому файлу."""
+    relative_path = request_path.lstrip('/')
+    normalized_path = os.path.normpath(relative_path)
+    full_path = os.path.join(BASE_DIR, normalized_path)
+    if os.path.commonpath([STATIC_DIR, full_path]) != STATIC_DIR:
+        return None
+    return full_path
 
 
 # ==================== БАЗА ДАННЫХ ====================
@@ -840,6 +864,38 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
         self._set_cors_headers()
         self.end_headers()
 
+    def serve_static_file(self, path):
+        """Отдача статических файлов."""
+        file_path = get_static_file_path(path)
+        if not file_path or not os.path.exists(file_path):
+            self.send_error(404)
+            return
+
+        content_types = {
+            '.css': 'text/css; charset=utf-8',
+            '.js': 'application/javascript; charset=utf-8',
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.svg': 'image/svg+xml',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp',
+        }
+
+        _, ext = os.path.splitext(file_path)
+        content_type = content_types.get(ext.lower(), 'application/octet-stream')
+
+        try:
+            with open(file_path, 'rb') as file:
+                content = file.read()
+            self.send_response(200)
+            self.send_header('Content-type', content_type)
+            self.end_headers()
+            self.wfile.write(content)
+        except Exception as e:
+            logger.error(f"Ошибка отдачи статического файла {file_path}: {e}")
+            self.send_error(500)
+
     def _check_protection(self):
         """Проверка защиты от DDoS и ограничения посещений"""
         ip_address = self.client_address[0]
@@ -1241,14 +1297,18 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
         path = parsed_path.path
 
         # Маршрутизация запросов
-        if path == '/':
+        if path.startswith('/static/'):
+            self.serve_static_file(path)
+        elif path == '/':
             self.serve_html()
         elif path == '/zayavka':
             self.serve_application_page()
         elif path == '/applications':
             self.serve_applications()
         elif path == '/statistics':
-            self.serve_statistics()
+            self.serve_statistics_page()
+        elif path == '/api/statistics':
+            self.serve_statistics_api()
         elif path == '/gallery-images':
             self.serve_gallery_images()
         elif path == '/rate-limit-status':
@@ -1356,1061 +1416,14 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
 
     def get_html_content(self):
         """Генерация HTML контента для главной страницы"""
-        return """
-        <!DOCTYPE html>
-        <html lang="ru">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Клан BENZ - Rust</title>
-            <style>
-                * {
-                    margin: 0;
-                    padding: 0;
-                    box-sizing: border-box;
-                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                }
-
-                body {
-                    background-color: #1a1a1a;
-                    color: #e0e0e0;
-                    line-height: 1.6;
-                }
-
-                header {
-                    background: linear-gradient(to right, #222, #333);
-                    padding: 1rem 0;
-                    text-align: center;
-                    border-bottom: 3px solid #ff9900;
-                    position: relative;
-                }
-
-                .header-top {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    padding: 0 2rem;
-                    margin-bottom: 1rem;
-                }
-
-                .header-buttons {
-                    display: flex;
-                    gap: 1rem;
-                }
-
-                .header-btn {
-                    background: #ff9900;
-                    color: #1a1a1a;
-                    border: none;
-                    padding: 0.6rem 1.2rem;
-                    border-radius: 5px;
-                    cursor: pointer;
-                    font-weight: bold;
-                    transition: background 0.3s;
-                    text-decoration: none;
-                    font-size: 0.9rem;
-                }
-
-                .header-btn:hover {
-                    background: #e68a00;
-                }
-
-                .header-btn.admin {
-                    background: #666;
-                    color: white;
-                }
-
-                .header-btn.admin:hover {
-                    background: #777;
-                }
-
-                .container {
-                    max-width: 1200px;
-                    margin: 0 auto;
-                    padding: 0 20px;
-                }
-
-                h1 {
-                    font-size: 3rem;
-                    color: #ff9900;
-                    text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
-                    margin-bottom: 0.5rem;
-                }
-
-                .tagline {
-                    font-size: 1.2rem;
-                    color: #cccccc;
-                    font-style: italic;
-                }
-
-                .hero {
-                    background: linear-gradient(135deg, #2a2a2a 0%, #1a1a1a 100%);
-                    padding: 4rem 0;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    text-align: center;
-                    position: relative;
-                    border-bottom: 1px solid #444;
-                }
-
-                .hero-content {
-                    position: relative;
-                    z-index: 1;
-                }
-
-                .hero h2 {
-                    font-size: 2.5rem;
-                    margin-bottom: 1rem;
-                    color: #ff9900;
-                }
-
-                .hero p {
-                    font-size: 1.2rem;
-                    max-width: 700px;
-                    margin: 0 auto;
-                    color: #cccccc;
-                }
-
-                .section {
-                    padding: 4rem 0;
-                }
-
-                .section-title {
-                    text-align: center;
-                    margin-bottom: 2rem;
-                    color: #ff9900;
-                    font-size: 2rem;
-                }
-
-                .features {
-                    display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-                    gap: 2rem;
-                    margin-bottom: 3rem;
-                }
-
-                .feature {
-                    background: #2a2a2a;
-                    padding: 2rem;
-                    border-radius: 8px;
-                    text-align: center;
-                    transition: transform 0.3s;
-                    border: 1px solid #444;
-                }
-
-                .feature:hover {
-                    transform: translateY(-5px);
-                    border-color: #ff9900;
-                }
-
-                .feature-icon {
-                    font-size: 3rem;
-                    margin-bottom: 1rem;
-                    color: #ff9900;
-                }
-
-                .feature h3 {
-                    margin-bottom: 1rem;
-                    color: #ff9900;
-                }
-
-                /* Галерея */
-                .gallery-section {
-                    background: #1a1a1a;
-                    padding: 3rem 0;
-                }
-
-                .gallery-container {
-                    max-width: 1400px;
-                    margin: 0 auto;
-                    padding: 0 20px;
-                }
-
-                .gallery {
-                    display: flex;
-                    overflow-x: auto;
-                    scroll-behavior: smooth;
-                    gap: 25px;
-                    padding: 30px 0;
-                    scrollbar-width: thin;
-                    scrollbar-color: #ff9900 #2a2a2a;
-                }
-
-                .gallery::-webkit-scrollbar {
-                    height: 12px;
-                }
-
-                .gallery::-webkit-scrollbar-track {
-                    background: #2a2a2a;
-                    border-radius: 10px;
-                }
-
-                .gallery::-webkit-scrollbar-thumb {
-                    background: #ff9900;
-                    border-radius: 10px;
-                }
-
-                .gallery-item {
-                    flex: 0 0 auto;
-                    width: 500px;
-                    height: 350px;
-                    border-radius: 15px;
-                    overflow: hidden;
-                    position: relative;
-                    transition: transform 0.3s ease, box-shadow 0.3s ease;
-                    border: 3px solid transparent;
-                    cursor: pointer;
-                }
-
-                .gallery-item:hover {
-                    transform: scale(1.05);
-                    box-shadow: 0 15px 35px rgba(255, 153, 0, 0.4);
-                    border-color: #ff9900;
-                }
-
-                .gallery-item img {
-                    width: 100%;
-                    height: 100%;
-                    object-fit: cover;
-                    transition: transform 0.3s ease;
-                }
-
-                .gallery-item:hover img {
-                    transform: scale(1.1);
-                }
-
-                .gallery-nav {
-                    display: flex;
-                    justify-content: center;
-                    gap: 15px;
-                    margin-top: 30px;
-                }
-
-                .gallery-nav-btn {
-                    background: #ff9900;
-                    color: #1a1a1a;
-                    border: none;
-                    padding: 12px 25px;
-                    border-radius: 8px;
-                    cursor: pointer;
-                    font-weight: bold;
-                    transition: background 0.3s;
-                    font-size: 16px;
-                }
-
-                .gallery-nav-btn:hover {
-                    background: #e68a00;
-                }
-
-                /* Модальное окно */
-                .modal {
-                    display: none;
-                    position: fixed;
-                    z-index: 1000;
-                    left: 0;
-                    top: 0;
-                    width: 100%;
-                    height: 100%;
-                    background-color: rgba(0,0,0,0.9);
-                    animation: fadeIn 0.3s;
-                }
-
-                @keyframes fadeIn {
-                    from { opacity: 0; }
-                    to { opacity: 1; }
-                }
-
-                .modal-content {
-                    margin: auto;
-                    display: block;
-                    max-width: 95%;
-                    max-height: 95%;
-                    margin-top: 2%;
-                    border-radius: 10px;
-                    box-shadow: 0 0 50px rgba(255, 153, 0, 0.3);
-                }
-
-                .close {
-                    position: absolute;
-                    top: 20px;
-                    right: 35px;
-                    color: #ff9900;
-                    font-size: 50px;
-                    font-weight: bold;
-                    cursor: pointer;
-                    transition: color 0.3s;
-                }
-
-                .close:hover {
-                    color: #fff;
-                }
-
-                .modal-caption {
-                    text-align: center;
-                    color: #fff;
-                    padding: 15px;
-                    font-size: 18px;
-                }
-
-                /* Кнопка заявки */
-                .application-section {
-                    text-align: center;
-                    padding: 3rem 0;
-                    background: #2a2a2a;
-                }
-
-                .application-btn {
-                    background: #ff9900;
-                    color: #1a1a1a;
-                    border: none;
-                    padding: 1.2rem 3rem;
-                    font-size: 1.3rem;
-                    border-radius: 8px;
-                    cursor: pointer;
-                    font-weight: bold;
-                    transition: all 0.3s;
-                    text-decoration: none;
-                    display: inline-block;
-                    margin: 1rem 0;
-                }
-
-                .application-btn:hover {
-                    background: #e68a00;
-                    transform: translateY(-2px);
-                    box-shadow: 0 10px 20px rgba(255, 153, 0, 0.3);
-                }
-
-                .server-info {
-                    background: #2a2a2a;
-                    padding: 1rem;
-                    border-radius: 8px;
-                    text-align: center;
-                    margin: 1rem auto;
-                    max-width: 600px;
-                    border: 1px solid #444;
-                }
-
-                footer {
-                    background: #222;
-                    padding: 2rem 0;
-                    text-align: center;
-                    border-top: 1px solid #444;
-                    margin-top: 2rem;
-                }
-
-                @media (max-width: 768px) {
-                    .container {
-                        padding: 0 15px;
-                    }
-
-                    .header-top {
-                        flex-direction: column;
-                        gap: 1rem;
-                        padding: 0 1rem;
-                    }
-
-                    .header-buttons {
-                        justify-content: center;
-                    }
-
-                    h1 {
-                        font-size: 2.2rem;
-                    }
-
-                    .hero h2 {
-                        font-size: 1.8rem;
-                    }
-
-                    .section {
-                        padding: 2rem 0;
-                    }
-
-                    .features {
-                        grid-template-columns: 1fr;
-                    }
-
-                    .application-btn {
-                        padding: 1rem 2rem;
-                        font-size: 1.1rem;
-                    }
-
-                    .gallery-item {
-                        width: 380px;
-                        height: 280px;
-                    }
-
-                    .modal-content {
-                        max-width: 98%;
-                        max-height: 85%;
-                        margin-top: 5%;
-                    }
-
-                    .close {
-                        top: 10px;
-                        right: 20px;
-                        font-size: 40px;
-                    }
-                }
-            </style>
-        </head>
-        <body>
-            <header>
-                <div class="header-top">
-                    <div class="header-buttons">
-                        <a href="/zayavka" class="header-btn">Подать заявку</a>
-                        <a href="/admin" class="header-btn admin">Войти в админку</a>
-                    </div>
-                </div>
-                <div class="container">
-                    <h1>КЛАН BENZ</h1>
-                    <p class="tagline">Самый крутой клан в Rust</p>
-                </div>
-            </header>
-
-            <!-- Галерея -->
-            <section class="gallery-section">
-                <div class="gallery-container">
-                    <h2 class="section-title">Галерея клана</h2>
-                    <div class="gallery" id="gallery">
-                        <!-- Изображения будут загружены через JavaScript -->
-                    </div>
-                    <div class="gallery-nav">
-                        <button class="gallery-nav-btn" onclick="scrollGallery(-400)">← Назад</button>
-                        <button class="gallery-nav-btn" onclick="scrollGallery(400)">Вперед →</button>
-                    </div>
-                </div>
-            </section>
-
-            <!-- Модальное окно для полноэкранного просмотра -->
-            <div id="imageModal" class="modal">
-                <span class="close" onclick="closeModal()">&times;</span>
-                <img class="modal-content" id="modalImage">
-                <div class="modal-caption" id="modalCaption"></div>
-            </div>
-
-            <!-- Секция "Почему BENZ?" -->
-            <section class="section">
-                <div class="container">
-                    <h2 class="section-title">Почему BENZ?</h2>
-                    <div class="features">
-                        <div class="feature">
-                            <div class="feature-icon">⚔️</div>
-                            <h3>Сильная команда</h3>
-                            <p>Опытные игроки с тысячами часов в игре, готовые прийти на помощь в любой ситуации.</p>
-                        </div>
-                        <div class="feature">
-                            <div class="feature-icon">🏰</div>
-                            <h3>Неприступные базы</h3>
-                            <p>Строим крепости, которые выдерживают самые серьезные рейды и осады.</p>
-                        </div>
-                        <div class="feature">
-                            <div class="feature-icon">💎</div>
-                            <h3>Богатые ресурсы</h3>
-                            <p>Постоянный доступ к лучшему оружию, броне и транспортным средствам.</p>
-                        </div>
-                    </div>
-                </div>
-            </section>
-
-            <!-- Секция с кнопкой заявки -->
-            <section class="application-section">
-                <div class="container">
-                    <h2 class="section-title">Готов вступить в клан?</h2>
-                    <p style="margin-bottom: 2rem; font-size: 1.2rem;">Нажмите на кнопку ниже, чтобы подать заявку на вступление</p>
-                    <a href="/zayavka" class="application-btn">Подать заявку</a>
-
-                    <div class="server-info">
-                        <strong>Статус:</strong> Сервер работает | <strong>Требования:</strong> 1500+ часов в игре
-                    </div>
-                </div>
-            </section>
-
-            <footer>
-                <div class="container">
-                    <p><strong>Клан BENZ</strong> © 2024 | Rust</p>
-                    <p>Присоединяйся к нам и стань частью легенды!</p>
-                </div>
-            </footer>
-
-            <script>
-                const GALLERY_IMAGES = """ + json.dumps(GALLERY_IMAGES) + """;
-
-                // Загрузка галереи
-                function loadGallery() {
-                    try {
-                        const gallery = document.getElementById('gallery');
-                        gallery.innerHTML = '';
-
-                        GALLERY_IMAGES.forEach((imageUrl, index) => {
-                            const galleryItem = document.createElement('div');
-                            galleryItem.className = 'gallery-item';
-                            galleryItem.innerHTML = `
-                                <img src="${imageUrl}" alt="Фото клана BENZ ${index + 1}" loading="lazy">
-                            `;
-                            galleryItem.onclick = function() {
-                                openModal(imageUrl, index + 1);
-                            };
-                            gallery.appendChild(galleryItem);
-                        });
-                    } catch (error) {
-                        console.error('Ошибка загрузки галереи:', error);
-                    }
-                }
-
-                // Плавная прокрутка галереи
-                function scrollGallery(distance) {
-                    const gallery = document.getElementById('gallery');
-                    gallery.scrollBy({
-                        left: distance,
-                        behavior: 'smooth'
-                    });
-                }
-
-                // Открытие модального окна
-                function openModal(imageUrl, imageNumber) {
-                    const modal = document.getElementById('imageModal');
-                    const modalImg = document.getElementById('modalImage');
-                    const caption = document.getElementById('modalCaption');
-
-                    modal.style.display = 'block';
-                    modalImg.src = imageUrl;
-                    caption.textContent = `Фото клана BENZ (${imageNumber}/${GALLERY_IMAGES.length})`;
-
-                    // Блокировка прокрутки body
-                    document.body.style.overflow = 'hidden';
-                }
-
-                // Закрытие модального окна
-                function closeModal() {
-                    const modal = document.getElementById('imageModal');
-                    modal.style.display = 'none';
-                    document.body.style.overflow = 'auto';
-                }
-
-                // Закрытие модального окна при клике вне изображения
-                window.onclick = function(event) {
-                    const modal = document.getElementById('imageModal');
-                    if (event.target === modal) {
-                        closeModal();
-                    }
-                }
-
-                // Закрытие модального окна клавишей ESC
-                document.addEventListener('keydown', function(event) {
-                    if (event.key === 'Escape') {
-                        closeModal();
-                    }
-                });
-
-                // Загружаем галерею при загрузке страницы
-                document.addEventListener('DOMContentLoaded', loadGallery);
-            </script>
-        </body>
-        </html>
-        """
+        return read_template('index.html')
 
     def get_application_page_content(self, can_submit):
         """Генерация HTML контента для страницы заявки"""
         if not can_submit:
-            return """
-            <!DOCTYPE html>
-            <html lang="ru">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Заявка - Клан BENZ</title>
-                <style>
-                    body {
-                        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                        background: #1a1a1a;
-                        color: #e0e0e0;
-                        margin: 0;
-                        padding: 0;
-                        display: flex;
-                        justify-content: center;
-                        align-items: center;
-                        min-height: 100vh;
-                    }
-                    .container {
-                        background: #2a2a2a;
-                        padding: 3rem;
-                        border-radius: 10px;
-                        text-align: center;
-                        border: 2px solid #ff9900;
-                        max-width: 500px;
-                        margin: 2rem;
-                    }
-                    h1 {
-                        color: #ff9900;
-                        margin-bottom: 1rem;
-                    }
-                    .message {
-                        font-size: 1.2rem;
-                        margin-bottom: 2rem;
-                        line-height: 1.6;
-                    }
-                    .btn {
-                        background: #666;
-                        color: white;
-                        padding: 1rem 2rem;
-                        text-decoration: none;
-                        border-radius: 5px;
-                        font-weight: bold;
-                        display: inline-block;
-                    }
-                    .btn:hover {
-                        background: #777;
-                    }
-                    .icon {
-                        font-size: 4rem;
-                        margin-bottom: 1rem;
-                    }
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <div class="icon">⏰</div>
-                    <h1>Заявка уже отправлена</h1>
-                    <div class="message">
-                        Вы уже отправили заявку на вступление в клан.<br>
-                        Пожалуйста, подождите 1 час перед отправкой следующей заявки.
-                    </div>
-                    <a href="/" class="btn">Вернуться на главную</a>
-                </div>
-            </body>
-            </html>
-            """
+            return read_template('application_blocked.html')
 
-        return """
-        <!DOCTYPE html>
-        <html lang="ru">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Подать заявку - Клан BENZ</title>
-            <style>
-                * {
-                    margin: 0;
-                    padding: 0;
-                    box-sizing: border-box;
-                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                }
-
-                body {
-                    background-color: #1a1a1a;
-                    color: #e0e0e0;
-                    line-height: 1.6;
-                }
-
-                header {
-                    background: linear-gradient(to right, #222, #333);
-                    padding: 1rem 0;
-                    text-align: center;
-                    border-bottom: 3px solid #ff9900;
-                    position: relative;
-                }
-
-                .header-top {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    padding: 0 2rem;
-                    margin-bottom: 1rem;
-                }
-
-                .header-buttons {
-                    display: flex;
-                    gap: 1rem;
-                }
-
-                .header-btn {
-                    background: #ff9900;
-                    color: #1a1a1a;
-                    border: none;
-                    padding: 0.6rem 1.2rem;
-                    border-radius: 5px;
-                    cursor: pointer;
-                    font-weight: bold;
-                    transition: background 0.3s;
-                    text-decoration: none;
-                    font-size: 0.9rem;
-                }
-
-                .header-btn:hover {
-                    background: #e68a00;
-                }
-
-                .header-btn.admin {
-                    background: #666;
-                    color: white;
-                }
-
-                .header-btn.admin:hover {
-                    background: #777;
-                }
-
-                .container {
-                    max-width: 800px;
-                    margin: 0 auto;
-                    padding: 0 20px;
-                }
-
-                h1 {
-                    font-size: 2.5rem;
-                    color: #ff9900;
-                    text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
-                    margin-bottom: 0.5rem;
-                }
-
-                .back-btn {
-                    background: #666;
-                    color: white;
-                    padding: 0.8rem 1.5rem;
-                    text-decoration: none;
-                    border-radius: 5px;
-                    font-weight: bold;
-                    display: inline-block;
-                    margin-top: 1rem;
-                }
-
-                .back-btn:hover {
-                    background: #777;
-                }
-
-                .section {
-                    padding: 3rem 0;
-                }
-
-                .application-form {
-                    background: #2a2a2a;
-                    padding: 2rem;
-                    border-radius: 8px;
-                    border: 1px solid #444;
-                }
-
-                .form-group {
-                    margin-bottom: 1.5rem;
-                }
-
-                label {
-                    display: block;
-                    margin-bottom: 0.5rem;
-                    color: #ff9900;
-                    font-weight: bold;
-                }
-
-                input, textarea, select {
-                    width: 100%;
-                    padding: 0.8rem;
-                    background: #1a1a1a;
-                    border: 1px solid #444;
-                    border-radius: 4px;
-                    color: #e0e0e0;
-                    font-size: 1rem;
-                }
-
-                input:focus, textarea:focus, select:focus {
-                    outline: none;
-                    border-color: #ff9900;
-                }
-
-                button {
-                    background: #ff9900;
-                    color: #1a1a1a;
-                    border: none;
-                    padding: 1rem 2rem;
-                    font-size: 1.1rem;
-                    border-radius: 4px;
-                    cursor: pointer;
-                    font-weight: bold;
-                    transition: background 0.3s;
-                    width: 100%;
-                }
-
-                button:hover {
-                    background: #e68a00;
-                }
-
-                .success-message {
-                    background: #2a2a2a;
-                    padding: 2rem;
-                    border-radius: 8px;
-                    text-align: center;
-                    border: 2px solid #4CAF50;
-                    display: none;
-                }
-
-                .error-message {
-                    background: #2a2a2a;
-                    padding: 1rem;
-                    border-radius: 8px;
-                    text-align: center;
-                    border: 2px solid #ff4444;
-                    color: #ff4444;
-                    display: none;
-                    margin-bottom: 1rem;
-                }
-
-                .server-info {
-                    background: #2a2a2a;
-                    padding: 1rem;
-                    border-radius: 8px;
-                    text-align: center;
-                    margin: 1rem auto;
-                    border: 1px solid #444;
-                }
-
-                @media (max-width: 768px) {
-                    .container {
-                        padding: 0 15px;
-                    }
-
-                    .header-top {
-                        flex-direction: column;
-                        gap: 1rem;
-                        padding: 0 1rem;
-                    }
-
-                    .header-buttons {
-                        justify-content: center;
-                    }
-
-                    h1 {
-                        font-size: 2rem;
-                    }
-
-                    .application-form {
-                        padding: 1.5rem;
-                    }
-                }
-            </style>
-        </head>
-        <body>
-            <header>
-                <div class="header-top">
-                    <div class="header-buttons">
-                        <a href="/zayavka" class="header-btn">Подать заявку</a>
-                        <a href="/admin" class="header-btn admin">Войти в админку</a>
-                    </div>
-                </div>
-                <div class="container">
-                    <h1>Подать заявку в клан BENZ</h1>
-                    <a href="/" class="back-btn">← Назад на главную</a>
-                </div>
-            </header>
-
-            <section class="section">
-                <div class="container">
-                    <div class="server-info">
-                        <strong>Требования:</strong> 1500+ часов в игре | <strong>Ограничение:</strong> 1 заявка в час
-                    </div>
-
-                    <div class="error-message" id="errorMessage">
-                        Произошла ошибка при отправке заявки. Пожалуйста, попробуйте еще раз.
-                    </div>
-
-                    <div class="application-form" id="applicationForm">
-                        <form id="clanApplication">
-                            <div class="form-group">
-                                <label for="nickname">Игровой никнейм *</label>
-                                <input type="text" id="nickname" name="nickname" required placeholder="Введите ваш никнейм в игре">
-                            </div>
-
-                            <div class="form-group">
-                                <label for="steamId">Steam ID или профиль *</label>
-                                <input type="text" id="steamId" name="steamId" required placeholder="Например: STEAM_0:1:12345678 или ссылка на профиль">
-                            </div>
-
-                            <div class="form-group">
-                                <label for="playtime">Часов в игре * (минимум 1500 часов)</label>
-                                <input type="number" id="playtime" name="playtime" required placeholder="Количество часов в Rust" min="1500">
-                            </div>
-
-                            <div class="form-group">
-                                <label for="discord">Discord username *</label>
-                                <input type="text" id="discord" name="discord" required placeholder="Например: username#1234">
-                            </div>
-
-                            <div class="form-group">
-                                <label for="role">Предпочитаемая роль в клане *</label>
-                                <select id="role" name="role" required>
-                                    <option value="">Выберите роль</option>
-                                    <option value="Фермер">Фермер ресурсов</option>
-                                    <option value="Строитель">Строитель баз</option>
-                                    <option value="Боец">Комбатер</option>
-                                    <option value="Коллер">Коллер</option>
-                                    <option value="Универсал">Универсал</option>
-                                </select>
-                            </div>
-
-                            <div class="form-group">
-                                <label for="message">Почему вы хотите вступить в наш клан? *</label>
-                                <textarea id="message" name="message" rows="4" required placeholder="Расскажите о себе, вашем опыте и почему мы должны принять вас в клан..."></textarea>
-                            </div>
-
-                            <button type="submit" id="submitBtn">Отправить заявку</button>
-                        </form>
-                    </div>
-
-                    <div class="success-message" id="successMessage">
-                        <h3>Заявка отправлена!</h3>
-                        <p>Спасибо за вашу заявку в клан BENZ! Мы рассмотрим её в ближайшее время и свяжемся с вами через Discord.</p>
-                        <a href="/" class="back-btn" style="margin-top: 1rem;">Вернуться на главную</a>
-                    </div>
-                </div>
-            </section>
-
-            <script>
-                // Обработчик формы заявки
-                document.getElementById('clanApplication').addEventListener('submit', async function(e) {
-                    e.preventDefault();
-
-                    const submitBtn = document.getElementById('submitBtn');
-                    submitBtn.disabled = true;
-                    submitBtn.textContent = 'Отправка...';
-                    document.getElementById('errorMessage').style.display = 'none';
-
-                    const formData = {
-                        nickname: document.getElementById('nickname').value,
-                        steamId: document.getElementById('steamId').value,
-                        playtime: document.getElementById('playtime').value,
-                        discord: document.getElementById('discord').value,
-                        role: document.getElementById('role').value,
-                        message: document.getElementById('message').value
-                    };
-
-                    // Проверка минимального количества часов
-                    if (parseInt(formData.playtime) < 1500) {
-                        document.getElementById('errorMessage').textContent = 'Минимальное количество часов для подачи заявки - 1500!';
-                        document.getElementById('errorMessage').style.display = 'block';
-                        submitBtn.disabled = false;
-                        submitBtn.textContent = 'Отправить заявку';
-                        return;
-                    }
-
-                    try {
-                        const response = await fetch('/submit_application', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/x-www-form-urlencoded',
-                            },
-                            body: new URLSearchParams(formData)
-                        });
-
-                        if (!response.ok) {
-                            const errorData = await response.json();
-                            throw new Error(errorData.message || `HTTP error! status: ${response.status}`);
-                        }
-
-                        const result = await response.json();
-
-                        if (result.status === 'success') {
-                            document.getElementById('applicationForm').style.display = 'none';
-                            document.getElementById('successMessage').style.display = 'block';
-                        } else {
-                            throw new Error(result.message || 'Ошибка сервера');
-                        }
-
-                    } catch (error) {
-                        console.error('Ошибка:', error);
-                        document.getElementById('errorMessage').textContent = error.message || 'Произошла неизвестная ошибка';
-                        document.getElementById('errorMessage').style.display = 'block';
-                        submitBtn.disabled = false;
-                        submitBtn.textContent = 'Отправить заявку';
-                    }
-                });
-            </script>
-        </body>
-        </html>
-        """
-
-    def handle_application(self):
-        """Обработка заявки"""
-        try:
-            content_length = int(self.headers.get('Content-Length', 0))
-            if content_length == 0:
-                self.send_response(400)
-                self.send_header('Content-type', 'application/json')
-                self._set_cors_headers()
-                self.end_headers()
-                self.wfile.write(json.dumps({'status': 'error', 'message': 'Пустые данные'}).encode())
-                return
-
-            post_data = self.rfile.read(content_length)
-            form_data = parse_qs(post_data.decode('utf-8'))
-
-            # Валидация обязательных полей
-            required_fields = ['nickname', 'steamId', 'playtime', 'discord', 'role', 'message']
-            for field in required_fields:
-                if field not in form_data or not form_data[field][0].strip():
-                    self.send_response(400)
-                    self.send_header('Content-type', 'application/json')
-                    self._set_cors_headers()
-                    self.end_headers()
-                    self.wfile.write(json.dumps({'status': 'error', 'message': f'Поле {field} обязательно'}).encode())
-                    return
-
-            application_data = {
-                'nickname': form_data['nickname'][0].strip(),
-                'steamId': form_data['steamId'][0].strip(),
-                'playtime': form_data['playtime'][0].strip(),
-                'discord': form_data['discord'][0].strip(),
-                'role': form_data['role'][0].strip(),
-                'message': form_data['message'][0].strip(),
-                'ip': self.client_address[0]
-            }
-
-            # Проверка часов
-            try:
-                playtime = int(application_data['playtime'])
-                if playtime < 1500:
-                    self.send_response(400)
-                    self.send_header('Content-type', 'application/json')
-                    self._set_cors_headers()
-                    self.end_headers()
-                    self.wfile.write(json.dumps({'status': 'error', 'message': 'Минимум 1500 часов!'}).encode())
-                    return
-            except ValueError:
-                self.send_response(400)
-                self.send_header('Content-type', 'application/json')
-                self._set_cors_headers()
-                self.end_headers()
-                self.wfile.write(json.dumps({'status': 'error', 'message': 'Некорректное количество часов'}).encode())
-                return
-
-            # Проверка лимита заявок
-            if not can_submit_application(application_data['ip']):
-                self.send_response(400)
-                self.send_header('Content-type', 'application/json')
-                self._set_cors_headers()
-                self.end_headers()
-                self.wfile.write(
-                    json.dumps({'status': 'error', 'message': 'Вы уже отправили заявку. Подождите 1 час.'}).encode())
-                return
-
-            # Сохранение заявки
-            application_id = save_application(application_data)
-
-            if application_id is None:
-                raise Exception("Не удалось сохранить заявку в базу данных")
-
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self._set_cors_headers()
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({'status': 'success', 'message': 'Заявка отправлена!', 'id': application_id}).encode())
-
-            logger.info(f"Новая заявка #{application_id} от {application_data['nickname']}")
-
-        except Exception as e:
-            logger.error(f"Ошибка обработки заявки: {e}", exc_info=True)
-            self.send_response(500)
-            self.send_header('Content-type', 'application/json')
-            self._set_cors_headers()
-            self.end_headers()
-            self.wfile.write(json.dumps({'status': 'error', 'message': 'Внутренняя ошибка сервера'}).encode())
+        return read_template('application_form.html')
 
     def serve_applications(self):
         """API для получения заявок"""
@@ -2426,7 +1439,19 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
             logger.error(f"Error serving applications: {e}")
             self.send_error(500)
 
-    def serve_statistics(self):
+    def serve_statistics_page(self):
+        """Отдача страницы статистики"""
+        try:
+            html_content = read_template('statistics.html')
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(html_content.encode('utf-8'))
+        except Exception as e:
+            logger.error(f"Error serving statistics page: {e}")
+            self.send_error(500)
+
+    def serve_statistics_api(self):
         """API для получения статистики"""
         try:
             stats = get_statistics()

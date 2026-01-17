@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Клан BENZ — главная</title>
+    <link rel="stylesheet" href="/static/main.css">
+</head>
+<body>
+    <header>
+        <div class="header-top">
+            <div class="header-buttons">
+                <a href="/zayavka" class="header-btn">Подать заявку</a>
+                <a href="/statistics" class="header-btn secondary">Статистика</a>
+                <a href="/admin" class="header-btn admin">Админка</a>
+            </div>
+        </div>
+        <div class="container">
+            <h1>КЛАН BENZ</h1>
+            <p class="tagline">Многофункциональный портал проектов клана</p>
+        </div>
+    </header>
+
+    <section class="hero">
+        <div class="hero-content">
+            <h2>Стартовая страница проектов</h2>
+            <p>
+                Здесь собраны основные разделы: заявка в клан, галерея, статистика и доступ в админ-панель.
+                Используйте карточки ниже, чтобы перейти в нужный проект.
+            </p>
+        </div>
+    </section>
+
+    <section class="section">
+        <div class="container">
+            <h2 class="section-title">Проекты сайта</h2>
+            <div class="project-grid">
+                <a class="project-card" href="/zayavka">
+                    <div class="project-icon">📝</div>
+                    <h3>Заявка в клан</h3>
+                    <p>Форма вступления, требования и статус рассмотрения.</p>
+                </a>
+                <a class="project-card" href="/statistics">
+                    <div class="project-icon">📊</div>
+                    <h3>Статистика</h3>
+                    <p>Просмотр активности, количества заявок и посещений.</p>
+                </a>
+                <a class="project-card" href="/#gallery">
+                    <div class="project-icon">🖼️</div>
+                    <h3>Галерея</h3>
+                    <p>Фото и моменты из жизни клана.</p>
+                </a>
+                <a class="project-card" href="/admin">
+                    <div class="project-icon">🔐</div>
+                    <h3>Админ-панель</h3>
+                    <p>Управление заявками, блокировками и режимом обслуживания.</p>
+                </a>
+            </div>
+        </div>
+    </section>
+
+    <section class="gallery-section" id="gallery">
+        <div class="gallery-container">
+            <h2 class="section-title">Галерея клана</h2>
+            <div class="gallery" id="galleryList"></div>
+            <div class="gallery-nav">
+                <button class="gallery-nav-btn" data-scroll="-400">← Назад</button>
+                <button class="gallery-nav-btn" data-scroll="400">Вперед →</button>
+            </div>
+        </div>
+    </section>
+
+    <div id="imageModal" class="modal">
+        <span class="close" data-action="close">&times;</span>
+        <img class="modal-content" id="modalImage">
+        <div class="modal-caption" id="modalCaption"></div>
+    </div>
+
+    <section class="application-section">
+        <div class="container">
+            <h2 class="section-title">Готов вступить в клан?</h2>
+            <p class="lead">Нажмите на кнопку ниже, чтобы подать заявку на вступление</p>
+            <a href="/zayavka" class="application-btn">Подать заявку</a>
+
+            <div class="server-info">
+                <strong>Статус:</strong> Сервер работает | <strong>Требования:</strong> 1500+ часов в игре
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="container">
+            <p><strong>Клан BENZ</strong> © 2024 | Rust</p>
+            <p>Присоединяйся к нам и стань частью легенды!</p>
+        </div>
+    </footer>
+
+    <script src="/static/main.js"></script>
+</body>
+</html>

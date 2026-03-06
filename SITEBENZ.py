@@ -2,18 +2,24 @@ import logging
 import threading
 import sqlite3
 import requests
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import json
 from urllib.parse import parse_qs, urlparse
 from datetime import datetime, timedelta
 import secrets
 import os
 import time
+import cgi
+import uuid
+import platform
+
+ps_start_time = time.time()
 
 # Пути к шаблонам и статике
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+UPLOADS_DIR = os.path.join(STATIC_DIR, "uploads")
 
 # Настройка логирования с поддержкой Unicode
 logging.basicConfig(
@@ -29,11 +35,8 @@ logger = logging.getLogger(__name__)
 # Конфигурация
 SERVER_PORT = 8080
 DATABASE_NAME = "clan_benz.db"
-MANAGE_PASSWORD = "admin123"
-
-# Ограничения посещений
-VISIT_LIMIT = 15  # Максимум 15 посещений в минуту
-VISIT_BLOCK_TIME = 60  # Блокировка на 1 минуту при превышении
+MAIN_ADMIN_USERNAME = "main_admin"
+MAIN_ADMIN_PASSWORD = "Gotlib2010"
 
 # Глобальные переменные для управления
 server_httpd = None
@@ -51,11 +54,7 @@ unique_visitors = set()
 # Сессии для админ панели
 admin_sessions = {}
 
-# Защита от DDoS атак
 ddos_protection_db = "ddos_protection.db"
-REQUEST_LIMIT = 100  # 100 запросов в минуту для DDoS защиты
-BLOCK_TIME = 300  # Блокировка на 5 минут для DDoS
-ip_request_times = {}
 
 # Фотографии для галереи
 GALLERY_IMAGES = [
@@ -71,6 +70,10 @@ GALLERY_IMAGES = [
     "https://i.postimg.cc/GhBYwSJB/image.png",
     "https://i.postimg.cc/bNGbcFHS/photo1.jpg"
 ]
+
+
+def _normalize_bool(value):
+    return bool(value) and str(value).lower() not in ('0', 'false', 'none')
 
 
 # ==================== РЕЖИМ ТЕХНИЧЕСКОГО ОБСЛУЖИВАНИЯ ====================
@@ -158,8 +161,43 @@ def init_databases():
                 application_count INTEGER DEFAULT 1
             )
         ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS admin_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                is_super_admin INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                created_by TEXT DEFAULT 'system'
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS gallery_images_custom (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                image_url TEXT UNIQUE NOT NULL,
+                added_by TEXT NOT NULL,
+                added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_active INTEGER DEFAULT 1
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS gallery_submissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                image_url TEXT UNIQUE NOT NULL,
+                submitted_by TEXT NOT NULL,
+                submitted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'pending',
+                reviewed_by TEXT,
+                reviewed_at DATETIME,
+                review_note TEXT
+            )
+        ''')
         conn.commit()
         conn.close()
+        ensure_main_admin_exists()
         logger.info("Основная база данных инициализирована")
 
         # База посещений
@@ -390,88 +428,12 @@ def get_manual_blocks():
 
 
 def check_visit_limit(ip_address, path='/'):
-    """Проверка ограничения посещений (15 в минуту)"""
+    """Проверка доступа по ручным блокировкам."""
     try:
-        # Сначала проверяем ручную блокировку
         is_manual_blocked, block_info = is_ip_manually_blocked(ip_address)
         if is_manual_blocked:
             logger.warning(f"Доступ запрещен: IP {ip_address} заблокирован вручную. Причина: {block_info['reason']}")
             return False, "manual_block"
-
-        conn = sqlite3.connect(ddos_protection_db)
-        cursor = conn.cursor()
-
-        current_time = datetime.now()
-        one_minute_ago = (current_time - timedelta(minutes=1)).isoformat()
-
-        # Проверяем, заблокирован ли IP за превышение лимита посещений
-        cursor.execute('''
-            SELECT block_start_time, is_blocked, block_reason FROM ip_blocks 
-            WHERE ip_address = ? AND is_blocked = TRUE AND is_manual_block = FALSE
-        ''', (ip_address,))
-
-        blocked_ip = cursor.fetchone()
-
-        if blocked_ip:
-            block_start_time = datetime.fromisoformat(blocked_ip[0])
-            block_reason = blocked_ip[2] if blocked_ip[2] else 'ddos'
-            time_diff = current_time - block_start_time
-
-            # Если прошло больше времени блокировки - разблокируем
-            if time_diff.total_seconds() >= VISIT_BLOCK_TIME:
-                cursor.execute('''
-                    UPDATE ip_blocks 
-                    SET is_blocked = FALSE, request_count = 1 
-                    WHERE ip_address = ? AND is_manual_block = FALSE
-                ''', (ip_address,))
-                conn.commit()
-                logger.info(f"IP разблокирован после превышения лимита: {ip_address}")
-            else:
-                conn.close()
-                # Если заблокирован за превышение лимита посещений
-                if block_reason == 'visit_limit':
-                    return False, "visit_limit"
-                # Если заблокирован за DDoS
-                else:
-                    return False, "ddos"
-
-        # Подсчитываем все запросы за последнюю минуту
-        cursor.execute('''
-            SELECT COUNT(*) FROM request_logs 
-            WHERE ip_address = ? AND timestamp > ?
-        ''', (ip_address, one_minute_ago))
-
-        total_requests = cursor.fetchone()[0]
-
-        # Если превышен лимит посещений - блокируем IP
-        if total_requests >= VISIT_LIMIT:
-            cursor.execute('''
-                INSERT OR REPLACE INTO ip_blocks 
-                (ip_address, block_start_time, is_blocked, request_count, block_reason, is_manual_block)
-                VALUES (?, ?, TRUE, ?, 'visit_limit', FALSE)
-            ''', (ip_address, current_time.isoformat(), total_requests))
-            conn.commit()
-            conn.close()
-            logger.warning(f"IP заблокирован за превышение лимита посещений: {ip_address}, запросов: {total_requests}")
-            return False, "visit_limit"
-
-        # Логируем текущий запрос
-        cursor.execute('''
-            INSERT INTO request_logs (ip_address, path, timestamp)
-            VALUES (?, ?, ?)
-        ''', (ip_address, path, current_time.isoformat()))
-
-        # Обновляем счетчик в ip_blocks
-        cursor.execute('''
-            INSERT OR REPLACE INTO ip_blocks 
-            (ip_address, block_start_time, request_count, is_blocked, block_reason, is_manual_block)
-            VALUES (?, ?, ?, FALSE, 'normal', FALSE)
-        ''', (ip_address, current_time.isoformat(), total_requests + 1))
-
-        conn.commit()
-        conn.close()
-
-        logger.debug(f"Запрос от {ip_address} ({path}), всего запросов за минуту: {total_requests + 1}")
         return True, "allowed"
 
     except Exception as e:
@@ -480,40 +442,8 @@ def check_visit_limit(ip_address, path='/'):
 
 
 def check_ddos_protection(ip_address):
-    """Проверка защиты от DDoS атак (более строгие лимиты)"""
-    try:
-        conn = sqlite3.connect(ddos_protection_db)
-        cursor = conn.cursor()
-
-        current_time = datetime.now()
-        one_minute_ago = (current_time - timedelta(minutes=1)).isoformat()
-
-        # Получаем количество запросов за последнюю минуту
-        cursor.execute('''
-            SELECT COUNT(*) FROM request_logs 
-            WHERE ip_address = ? AND timestamp > ?
-        ''', (ip_address, one_minute_ago))
-
-        request_count = cursor.fetchone()[0]
-
-        # Если превышен DDoS лимит - блокируем IP
-        if request_count >= REQUEST_LIMIT:
-            cursor.execute('''
-                INSERT OR REPLACE INTO ip_blocks 
-                (ip_address, block_start_time, is_blocked, request_count, block_reason, is_manual_block)
-                VALUES (?, ?, TRUE, ?, 'ddos', FALSE)
-            ''', (ip_address, current_time.isoformat(), request_count))
-            conn.commit()
-            conn.close()
-            logger.warning(f"IP заблокирован за DDoS: {ip_address}, запросов: {request_count}")
-            return False
-
-        conn.close()
-        return True
-
-    except Exception as e:
-        logger.error(f"Ошибка проверки DDoS защиты: {e}")
-        return True
+    """Автоматическая DDoS-защита отключена."""
+    return True
 
 
 def cleanup_old_logs():
@@ -809,27 +739,73 @@ def get_extended_statistics():
         }
 
 
-def check_admin_auth(cookie_header):
-    """Проверка авторизации администратора"""
+def ensure_main_admin_exists():
+    """Гарантирует наличие главного администратора."""
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO admin_users (id, username, password, is_super_admin, created_by)
+        VALUES (
+            COALESCE((SELECT id FROM admin_users WHERE username = ?), NULL),
+            ?, ?, 1, 'system'
+        )
+    ''', (MAIN_ADMIN_USERNAME, MAIN_ADMIN_USERNAME, MAIN_ADMIN_PASSWORD))
+    conn.commit()
+    conn.close()
+
+
+def get_admin_by_credentials(username, password):
+    """Возвращает данные админа по логину/паролю."""
+    try:
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT username, is_super_admin
+            FROM admin_users
+            WHERE username = ? AND password = ?
+        ''', (username, password))
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            return None
+
+        return {
+            'username': row[0],
+            'is_super_admin': _normalize_bool(row[1])
+        }
+    except Exception as e:
+        logger.error(f"Ошибка проверки учетных данных админа: {e}")
+        return None
+
+
+def get_current_admin(cookie_header):
+    """Возвращает текущую админ-сессию или None."""
     if not cookie_header:
-        return False
+        return None
 
     try:
         cookies = parse_cookies(cookie_header)
         session_id = cookies.get('admin_session')
-        if session_id and session_id in admin_sessions:
-            # Проверяем время жизни сессии (1 час)
-            session_time = admin_sessions[session_id]
-            if (datetime.now() - session_time).total_seconds() < 3600:
-                # Обновляем время сессии
-                admin_sessions[session_id] = datetime.now()
-                return True
-            else:
-                # Удаляем просроченную сессию
-                del admin_sessions[session_id]
-    except:
-        pass
-    return False
+        session_data = admin_sessions.get(session_id)
+        if not session_data:
+            return None
+
+        session_time = session_data['last_seen']
+        if (datetime.now() - session_time).total_seconds() >= 3600:
+            del admin_sessions[session_id]
+            return None
+
+        session_data['last_seen'] = datetime.now()
+        return session_data
+    except Exception as e:
+        logger.error(f"Ошибка проверки админ-сессии: {e}")
+        return None
+
+
+def check_admin_auth(cookie_header):
+    """Проверка авторизации администратора"""
+    return get_current_admin(cookie_header) is not None
 
 
 def parse_cookies(cookie_header):
@@ -842,11 +818,245 @@ def parse_cookies(cookie_header):
     return cookies
 
 
-def create_admin_session():
+def create_admin_session(admin_data):
     """Создание новой сессии администратора"""
     session_id = secrets.token_hex(16)
-    admin_sessions[session_id] = datetime.now()
+    admin_sessions[session_id] = {
+        'username': admin_data['username'],
+        'is_super_admin': admin_data['is_super_admin'],
+        'last_seen': datetime.now()
+    }
     return session_id
+
+
+def add_admin_user(username, password, created_by):
+    """Добавляет нового администратора."""
+    try:
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO admin_users (username, password, is_super_admin, created_by)
+            VALUES (?, ?, 0, ?)
+        ''', (username, password, created_by))
+        conn.commit()
+        conn.close()
+        return True, "Администратор добавлен"
+    except sqlite3.IntegrityError:
+        return False, "Администратор с таким логином уже существует"
+    except Exception as e:
+        logger.error(f"Ошибка добавления администратора: {e}")
+        return False, "Внутренняя ошибка"
+
+
+def add_gallery_image_submission(image_url, submitted_by, is_super_admin=False):
+    """Добавляет фото в галерею или на модерацию."""
+    try:
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+
+        if is_super_admin:
+            cursor.execute('''
+                INSERT OR IGNORE INTO gallery_images_custom (image_url, added_by)
+                VALUES (?, ?)
+            ''', (image_url, submitted_by))
+            conn.commit()
+            conn.close()
+            return True, "Фото добавлено на главный экран"
+
+        cursor.execute('''
+            INSERT OR IGNORE INTO gallery_submissions (image_url, submitted_by, status)
+            VALUES (?, ?, 'pending')
+        ''', (image_url, submitted_by))
+        conn.commit()
+        conn.close()
+        return True, "Фото отправлено на модерацию главному админу"
+    except Exception as e:
+        logger.error(f"Ошибка добавления фото: {e}")
+        return False, "Внутренняя ошибка"
+
+
+def get_gallery_images():
+    """Публичные изображения галереи."""
+    images = list(GALLERY_IMAGES)
+    try:
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT image_url FROM gallery_images_custom
+            WHERE is_active = 1
+            ORDER BY id DESC
+        ''')
+        custom = [row[0] for row in cursor.fetchall()]
+        conn.close()
+
+        for url in custom:
+            if url not in images:
+                images.append(url)
+        return images
+    except Exception as e:
+        logger.error(f"Ошибка получения фото галереи: {e}")
+        return images
+
+
+def get_pending_gallery_submissions():
+    """Список фото на модерации."""
+    try:
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, image_url, submitted_by, submitted_at
+            FROM gallery_submissions
+            WHERE status = 'pending'
+            ORDER BY submitted_at DESC
+        ''')
+        rows = cursor.fetchall()
+        conn.close()
+        return [
+            {
+                'id': row[0],
+                'image_url': row[1],
+                'submitted_by': row[2],
+                'submitted_at': row[3]
+            }
+            for row in rows
+        ]
+    except Exception as e:
+        logger.error(f"Ошибка получения очереди модерации: {e}")
+        return []
+
+
+def approve_gallery_submission(submission_id, reviewed_by):
+    """Одобряет фото из модерации."""
+    try:
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT image_url FROM gallery_submissions
+            WHERE id = ? AND status = 'pending'
+        ''', (submission_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return False, "Заявка не найдена"
+
+        image_url = row[0]
+        cursor.execute('''
+            INSERT OR IGNORE INTO gallery_images_custom (image_url, added_by)
+            VALUES (?, ?)
+        ''', (image_url, reviewed_by))
+        cursor.execute('''
+            UPDATE gallery_submissions
+            SET status = 'approved', reviewed_by = ?, reviewed_at = ?
+            WHERE id = ?
+        ''', (reviewed_by, datetime.now().isoformat(), submission_id))
+        conn.commit()
+        conn.close()
+        return True, "Фото одобрено и добавлено"
+    except Exception as e:
+        logger.error(f"Ошибка одобрения фото: {e}")
+        return False, "Внутренняя ошибка"
+
+
+def get_system_info():
+    """Базовая информация о системе для админки."""
+    return {
+        'platform': platform.platform(),
+        'python_version': platform.python_version(),
+        'cpu_count': os.cpu_count() or 1,
+        'hostname': platform.node() or 'unknown'
+    }
+
+
+def _read_meminfo_mb():
+    """Возвращает total/available память в МБ (Linux)."""
+    total_mb = 0
+    available_mb = 0
+    try:
+        with open('/proc/meminfo', 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    total_mb = int(line.split()[1]) // 1024
+                elif line.startswith('MemAvailable:'):
+                    available_mb = int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return total_mb, available_mb
+
+
+def get_system_metrics():
+    """Текущие метрики нагрузки системы."""
+    load_1 = load_5 = load_15 = 0.0
+    try:
+        load_1, load_5, load_15 = os.getloadavg()
+    except (OSError, AttributeError):
+        pass
+
+    cpu_count = os.cpu_count() or 1
+    cpu_usage_percent = round((load_1 / cpu_count) * 100, 2)
+
+    total_mb, available_mb = _read_meminfo_mb()
+    used_mb = max(0, total_mb - available_mb)
+    mem_usage_percent = round((used_mb / total_mb) * 100, 2) if total_mb else 0
+
+    disk = {'total_mb': 0, 'used_mb': 0, 'free_mb': 0, 'usage_percent': 0}
+    try:
+        st = os.statvfs(BASE_DIR)
+        total = (st.f_blocks * st.f_frsize) // (1024 * 1024)
+        free = (st.f_bavail * st.f_frsize) // (1024 * 1024)
+        used = max(0, total - free)
+        disk = {
+            'total_mb': total,
+            'used_mb': used,
+            'free_mb': free,
+            'usage_percent': round((used / total) * 100, 2) if total else 0
+        }
+    except Exception:
+        pass
+
+    return {
+        'load_avg': {
+            'one_min': round(load_1, 2),
+            'five_min': round(load_5, 2),
+            'fifteen_min': round(load_15, 2)
+        },
+        'cpu_usage_percent': cpu_usage_percent,
+        'memory': {
+            'total_mb': total_mb,
+            'used_mb': used_mb,
+            'available_mb': available_mb,
+            'usage_percent': mem_usage_percent
+        },
+        'disk': disk,
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    }
+
+
+def save_uploaded_image(file_item):
+    """Сохраняет загруженное фото в static/uploads и возвращает URL."""
+    filename_attr = getattr(file_item, 'filename', None) if file_item is not None else None
+    if file_item is None or not isinstance(filename_attr, str) or not filename_attr.strip():
+        return False, "Файл не передан", None
+
+    filename = os.path.basename(filename_attr)
+    ext = os.path.splitext(filename)[1].lower()
+    allowed = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+    if ext not in allowed:
+        return False, "Разрешены только .jpg/.jpeg/.png/.webp/.gif", None
+
+    file_data = file_item.file.read()
+    if not file_data:
+        return False, "Файл пустой", None
+    if len(file_data) > 8 * 1024 * 1024:
+        return False, "Файл слишком большой (максимум 8 МБ)", None
+
+    os.makedirs(UPLOADS_DIR, exist_ok=True)
+    unique_name = f"{uuid.uuid4().hex}{ext}"
+    file_path = os.path.join(UPLOADS_DIR, unique_name)
+    with open(file_path, 'wb') as f:
+        f.write(file_data)
+
+    return True, "ok", f"/static/uploads/{unique_name}"
 
 
 # ==================== ВЕБ-СЕРВЕР КЛАНА ====================
@@ -890,6 +1100,7 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
                 content = file.read()
             self.send_response(200)
             self.send_header('Content-type', content_type)
+            self.send_header('Cache-Control', 'public, max-age=86400')
             self.end_headers()
             self.wfile.write(content)
         except Exception as e:
@@ -897,32 +1108,23 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
             self.send_error(500)
 
     def _check_protection(self):
-        """Проверка защиты от DDoS и ограничения посещений"""
+        """Проверка ручной блокировки IP."""
         ip_address = self.client_address[0]
 
         # Очищаем старые логи раз в 20 запросов (для оптимизации)
         if hash(ip_address) % 20 == 0:
             cleanup_old_logs()
 
-        # Сначала проверяем ограничение посещений (15 в минуту)
+        # Проверяем только ручные блокировки
         visit_allowed, visit_reason = check_visit_limit(ip_address, self.path)
 
         if not visit_allowed:
             if visit_reason == "manual_block":
                 self._send_manual_block_error(ip_address)
                 return False
-            elif visit_reason == "visit_limit":
-                self._send_visit_limit_error(ip_address)
-                return False
             else:
-                # Если заблокирован за DDoS
                 self._send_ddos_error(ip_address)
                 return False
-
-        # Затем проверяем защиту от DDoS (более строгие лимиты)
-        if not check_ddos_protection(ip_address):
-            self._send_ddos_error(ip_address)
-            return False
 
         return True
 
@@ -1010,7 +1212,7 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(error_html.encode('utf-8'))
 
     def _send_visit_limit_error(self, ip_address):
-        """Отправка ошибки превышения лимита посещений"""
+        """Совместимый ответ, если ограничение трафика включат в будущем."""
         self.send_response(429)  # Too Many Requests
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
@@ -1087,7 +1289,7 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
                 <p>Вы превысили лимит посещений сайта.</p>
 
                 <div class="info">
-                    <p><strong>Ограничение:</strong> не более {VISIT_LIMIT} посещений в минуту</p>
+                    <p><strong>Ограничение:</strong> временно отключено</p>
                     <p><strong>Ваш IP:</strong> {ip_address}</p>
                     <p><strong>Статус:</strong> временно заблокирован</p>
                 </div>
@@ -1345,6 +1547,12 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
             self.serve_admin_applications()
         elif path == '/admin/api/manual-blocks':
             self.serve_admin_manual_blocks()
+        elif path == '/admin/api/server-status':
+            self.serve_admin_server_status()
+        elif path == '/admin/api/system-metrics':
+            self.serve_admin_system_metrics()
+        elif path == '/admin/api/gallery/pending':
+            self.serve_pending_gallery_submissions()
         elif path == '/admin/logout':
             self.handle_admin_logout()
         else:
@@ -1360,6 +1568,14 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
             self.handle_admin_remove_manual_block()
         elif path == '/admin/api/maintenance/toggle':
             self.handle_maintenance_toggle()
+        elif path == '/admin/api/admins/add':
+            self.handle_add_admin_user()
+        elif path == '/admin/api/gallery/add':
+            self.handle_add_gallery_image()
+        elif path == '/admin/api/gallery/upload':
+            self.handle_upload_gallery_image()
+        elif path == '/admin/api/gallery/approve':
+            self.handle_approve_gallery_submission()
         else:
             self.send_error(404)
 
@@ -1440,7 +1656,11 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
             self.send_error(500)
 
     def serve_statistics_page(self):
-        """Отдача страницы статистики"""
+        """Отдача страницы статистики только для администраторов"""
+        if not check_admin_auth(self.headers.get('Cookie', '')):
+            self.redirect_to_admin_login()
+            return
+
         try:
             html_content = read_template('statistics.html')
             self.send_response(200)
@@ -1452,9 +1672,25 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
             self.send_error(500)
 
     def serve_statistics_api(self):
-        """API для получения статистики"""
+        """API статистики только для администраторов"""
+        if not check_admin_auth(self.headers.get('Cookie', '')):
+            self.send_error(403)
+            return
+
         try:
-            stats = get_statistics()
+            stats = {
+                'applications': get_extended_statistics(),
+                'visits': get_visit_stats(),
+                'services': {
+                    'server': 'Запущен',
+                    'server_port': SERVER_PORT,
+                    'database': 'Работает'
+                },
+                'system': {
+                    'active_sessions': len(admin_sessions),
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+            }
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self._set_cors_headers()
@@ -1471,49 +1707,26 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'application/json')
             self._set_cors_headers()
             self.end_headers()
-            self.wfile.write(json.dumps(GALLERY_IMAGES).encode('utf-8'))
+            self.wfile.write(json.dumps(get_gallery_images()).encode('utf-8'))
         except Exception as e:
             logger.error(f"Error serving gallery images: {e}")
             self.send_error(500)
 
     def serve_rate_limit_status(self):
-        """API для проверки текущего статуса ограничений"""
+        """API совместимости: авто-ограничения отключены."""
         try:
             ip_address = self.client_address[0]
-            conn = sqlite3.connect(ddos_protection_db)
-            cursor = conn.cursor()
-
             current_time = datetime.now()
-            one_minute_ago = (current_time - timedelta(minutes=1)).isoformat()
 
-            # Получаем количество запросов за последнюю минуту
-            cursor.execute('''
-                SELECT COUNT(*) FROM request_logs 
-                WHERE ip_address = ? AND timestamp > ?
-            ''', (ip_address, one_minute_ago))
-
-            current_requests = cursor.fetchone()[0]
-            remaining_requests = max(0, VISIT_LIMIT - current_requests)
-
-            # Проверяем блокировку
-            cursor.execute('''
-                SELECT block_start_time, block_reason FROM ip_blocks 
-                WHERE ip_address = ? AND is_blocked = TRUE
-            ''', (ip_address,))
-
-            blocked_result = cursor.fetchone()
-            blocked = blocked_result is not None
-            block_reason = blocked_result[1] if blocked else None
-
-            conn.close()
+            is_blocked, block_info = is_ip_manually_blocked(ip_address)
 
             status_data = {
                 'ip': ip_address,
-                'current_requests': current_requests,
-                'limit': VISIT_LIMIT,
-                'remaining': remaining_requests,
-                'blocked': blocked,
-                'block_reason': block_reason,
+                'current_requests': 0,
+                'limit': None,
+                'remaining': None,
+                'blocked': is_blocked,
+                'block_reason': block_info.get('reason') if is_blocked else None,
                 'reset_time': (current_time + timedelta(minutes=1)).isoformat()
             }
 
@@ -1601,6 +1814,71 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
             logger.error(f"Ошибка получения списка блокировок: {e}")
             self.send_error(500)
 
+    def serve_admin_server_status(self):
+        """API статуса сервера для админки"""
+        if not check_admin_auth(self.headers.get('Cookie', '')):
+            self.send_error(403)
+            return
+
+        try:
+            uptime = int(time.time() - ps_start_time)
+            payload = {
+                'server': 'online',
+                'port': SERVER_PORT,
+                'maintenance': MAINTENANCE_MODE,
+                'uptime_seconds': uptime,
+                'active_sessions': len(admin_sessions),
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'system_info': get_system_info(),
+                'metrics': get_system_metrics()
+            }
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(payload).encode('utf-8'))
+        except Exception as e:
+            logger.error(f"Ошибка получения статуса сервера: {e}")
+            self.send_error(500)
+
+    def serve_admin_system_metrics(self):
+        """API метрик нагрузки для графиков в админке."""
+        if not check_admin_auth(self.headers.get('Cookie', '')):
+            self.send_error(403)
+            return
+
+        try:
+            payload = {
+                'system_info': get_system_info(),
+                'metrics': get_system_metrics()
+            }
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(payload).encode('utf-8'))
+        except Exception as e:
+            logger.error(f"Ошибка получения метрик системы: {e}")
+            self.send_error(500)
+
+    def serve_pending_gallery_submissions(self):
+        """Список фото на модерации."""
+        session = get_current_admin(self.headers.get('Cookie', ''))
+        if not session:
+            self.send_error(403)
+            return
+
+        if not session.get('is_super_admin'):
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'items': []}).encode('utf-8'))
+            return
+
+        items = get_pending_gallery_submissions()
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({'items': items}).encode('utf-8'))
+
     def handle_admin_login(self):
         """Обработка входа в админку"""
         try:
@@ -1608,13 +1886,17 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
             post_data = self.rfile.read(content_length)
             data = json.loads(post_data.decode('utf-8'))
 
-            if data.get('password') == MANAGE_PASSWORD:
-                session_id = create_admin_session()
+            username = data.get('username', MAIN_ADMIN_USERNAME)
+            password = data.get('password', '')
+            admin_data = get_admin_by_credentials(username, password)
+
+            if admin_data:
+                session_id = create_admin_session(admin_data)
                 self.send_response(200)
                 self.send_header('Set-Cookie', f'admin_session={session_id}; Path=/; HttpOnly; Max-Age=3600')
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
-                self.wfile.write(json.dumps({'success': True}).encode())
+                self.wfile.write(json.dumps({'success': True, 'username': admin_data['username']}).encode())
             else:
                 self.send_response(401)
                 self.send_header('Content-type', 'application/json')
@@ -1638,6 +1920,138 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
         self.send_header('Location', '/admin/login')
         self.end_headers()
 
+    def handle_add_admin_user(self):
+        """Добавление администратора главным админом."""
+        session = get_current_admin(self.headers.get('Cookie', ''))
+        if not session or not session.get('is_super_admin'):
+            self.send_error(403)
+            return
+
+        try:
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+
+            username = (data.get('username') or '').strip()
+            password = (data.get('password') or '').strip()
+            if len(username) < 3 or len(password) < 4:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'success': False, 'message': 'Логин/пароль слишком короткие'}).encode())
+                return
+
+            success, message = add_admin_user(username, password, session['username'])
+            self.send_response(200 if success else 400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': success, 'message': message}).encode())
+        except Exception as e:
+            logger.error(f"Ошибка добавления админа: {e}")
+            self.send_error(500)
+
+    def handle_add_gallery_image(self):
+        """Добавление фото в галерею/на модерацию."""
+        session = get_current_admin(self.headers.get('Cookie', ''))
+        if not session:
+            self.send_error(403)
+            return
+
+        try:
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+
+            image_url = (data.get('image_url') or '').strip()
+            if not image_url.startswith('http'):
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'success': False, 'message': 'Нужна корректная ссылка на изображение'}).encode())
+                return
+
+            success, message = add_gallery_image_submission(
+                image_url,
+                session['username'],
+                session.get('is_super_admin', False)
+            )
+            self.send_response(200 if success else 400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': success, 'message': message}).encode())
+        except Exception as e:
+            logger.error(f"Ошибка добавления фото: {e}")
+            self.send_error(500)
+
+    def handle_upload_gallery_image(self):
+        """Загрузка фото файлом (.jpg/.png/...) в галерею/модерацию."""
+        session = get_current_admin(self.headers.get('Cookie', ''))
+        if not session:
+            self.send_error(403)
+            return
+
+        try:
+            form = cgi.FieldStorage(
+                fp=self.rfile,
+                headers=self.headers,
+                environ={
+                    'REQUEST_METHOD': 'POST',
+                    'CONTENT_TYPE': self.headers.get('Content-Type', ''),
+                    'CONTENT_LENGTH': self.headers.get('Content-Length', '0')
+                }
+            )
+
+            try:
+                file_item = form['image_file']
+            except KeyError:
+                file_item = None
+            ok, message, image_url = save_uploaded_image(file_item)
+            if not ok:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'success': False, 'message': message}).encode())
+                return
+
+            success, submit_message = add_gallery_image_submission(
+                image_url,
+                session['username'],
+                session.get('is_super_admin', False)
+            )
+            self.send_response(200 if success else 400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                'success': success,
+                'message': submit_message if success else 'Ошибка добавления фото',
+                'image_url': image_url
+            }).encode())
+        except Exception as e:
+            logger.error(f"Ошибка загрузки фото: {e}")
+            self.send_error(500)
+
+    def handle_approve_gallery_submission(self):
+        """Одобрение фото главным админом."""
+        session = get_current_admin(self.headers.get('Cookie', ''))
+        if not session or not session.get('is_super_admin'):
+            self.send_error(403)
+            return
+
+        try:
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            submission_id = int(data.get('submission_id'))
+
+            success, message = approve_gallery_submission(submission_id, session['username'])
+            self.send_response(200 if success else 400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': success, 'message': message}).encode())
+        except Exception as e:
+            logger.error(f"Ошибка одобрения фото: {e}")
+            self.send_error(500)
+
     def handle_admin_add_manual_block(self):
         """Добавление блокировки через админку"""
         if not check_admin_auth(self.headers.get('Cookie', '')):
@@ -1660,7 +2074,8 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({'success': False, 'message': 'IP-адрес обязателен'}).encode())
                 return
 
-            blocked_by = "admin"
+            current_admin = get_current_admin(self.headers.get('Cookie', '')) or {'username': 'admin'}
+            blocked_by = current_admin['username']
             success = add_manual_block(ip_address, blocked_by, reason, int(expires_hours) if expires_hours else None)
 
             self.send_response(200)
@@ -1713,63 +2128,65 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
         """Генерация HTML контента для админки"""
         maintenance_status = "ВКЛЮЧЕН" if MAINTENANCE_MODE else "ВЫКЛЮЧЕН"
         maintenance_class = "status status-offline" if MAINTENANCE_MODE else "status status-online"
+        admin_session = get_current_admin(self.headers.get('Cookie', '')) or {}
+        current_admin = admin_session.get('username', 'admin')
+        is_super_admin = admin_session.get('is_super_admin', False)
 
-        return """
+        return f"""
         <!DOCTYPE html>
         <html>
         <head>
             <title>Управление кланом BENZ</title>
             <meta charset="utf-8">
             <style>
-                body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #1a1a1a; color: white; }
-                .container { max-width: 1200px; margin: 0 auto; }
-                .header { background: #2a2a2a; color: #ff9900; padding: 20px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #444; position: relative; }
-                .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 20px; }
-                .stat-card { background: #2a2a2a; padding: 20px; border-radius: 10px; border: 1px solid #444; max-height: 300px; overflow: hidden; }
-                .stat-card div[style*="overflow-y"] { scrollbar-width: thin; scrollbar-color: #ff9900 #2a2a2a; }
-                .stat-card div[style*="overflow-y"]::-webkit-scrollbar { width: 6px; }
-                .stat-card div[style*="overflow-y"]::-webkit-scrollbar-track { background: #2a2a2a; border-radius: 3px; }
-                .stat-card div[style*="overflow-y"]::-webkit-scrollbar-thumb { background: #ff9900; border-radius: 3px; }
-                .control-panel { background: #2a2a2a; padding: 20px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #444; }
-                .btn { padding: 10px 20px; margin: 5px; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; text-decoration: none; display: inline-block; }
-                .btn-primary { background: #ff9900; color: white; }
-                .btn-danger { background: #e74c3c; color: white; }
-                .btn-success { background: #27ae60; color: white; }
-                .btn-warning { background: #f39c12; color: white; }
-                .status { padding: 5px 10px; border-radius: 15px; font-size: 12px; margin-left: 10px; }
-                .status-online { background: #27ae60; color: white; }
-                .status-offline { background: #e74c3c; color: white; }
-                .logout-btn { background: #666; color: white; float: right; }
-                .back-btn { background: #444; color: white; float: left; }
-                .maintenance-alert { 
-                    background: #e74c3c; 
-                    color: white; 
-                    padding: 15px; 
-                    border-radius: 5px; 
-                    margin-bottom: 20px;
-                    border-left: 5px solid #c0392b;
-                }
-                .tab { overflow: hidden; border: 1px solid #444; background-color: #2a2a2a; border-radius: 5px; margin-bottom: 20px; }
-                .tab button { background-color: inherit; float: left; border: none; outline: none; cursor: pointer; padding: 14px 16px; transition: 0.3s; color: white; font-size: 16px; }
-                .tab button:hover { background-color: #333; }
-                .tab button.active { background-color: #ff9900; color: black; font-weight: bold; }
-                .tabcontent { display: none; padding: 20px 0; }
-                .applications-table { width: 100%; border-collapse: collapse; margin-top: 20px; background: #2a2a2a; border-radius: 10px; overflow: hidden; }
-                .applications-table th, .applications-table td { padding: 15px; text-align: left; border-bottom: 1px solid #444; }
-                .applications-table th { background: #333; color: #ff9900; font-weight: bold; }
-                .applications-table tr:hover { background: #333; }
-                .applications-table td { color: #e0e0e0; }
-                .message-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-                .message-cell:hover { white-space: normal; overflow: visible; }
-                .form-group { margin-bottom: 15px; }
-                .form-group label { display: block; margin-bottom: 5px; color: #ff9900; font-weight: bold; }
-                .form-group input, .form-group textarea, .form-group select { width: 100%; padding: 8px; background: #1a1a1a; border: 1px solid #444; border-radius: 4px; color: white; }
-                .manual-blocks-list { margin-top: 20px; }
-                .block-item { background: #2a2a2a; padding: 15px; margin-bottom: 10px; border-radius: 5px; border-left: 4px solid #e74c3c; }
-                .block-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-                .block-ip { font-weight: bold; color: #ff9900; }
-                .block-reason { color: #cccccc; }
-                .block-meta { font-size: 12px; color: #999; }
+                body {{ font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #1a1a1a; color: white; }}
+                .container {{ max-width: 1200px; margin: 0 auto; }}
+                .header {{ background: #2a2a2a; color: #ff9900; padding: 20px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #444; position: relative; }}
+                .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 20px; }}
+                .stat-card {{ background: #2a2a2a; padding: 20px; border-radius: 10px; border: 1px solid #444; }}
+                .chart-wrap {{ margin-top: 10px; }}
+                .chart-row {{ margin-bottom: 10px; }}
+                .chart-label {{ font-size: 13px; color: #ccc; margin-bottom: 4px; }}
+                .chart-bar-bg {{ height: 10px; background: #333; border-radius: 6px; overflow: hidden; }}
+                .chart-bar {{ height: 100%; background: linear-gradient(90deg, #ff9900, #f1c40f); }}
+                .control-panel {{ background: #2a2a2a; padding: 20px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #444; }}
+                .btn {{ padding: 10px 20px; margin: 5px; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; text-decoration: none; display: inline-block; }}
+                .btn-primary {{ background: #ff9900; color: white; }}
+                .btn-danger {{ background: #e74c3c; color: white; }}
+                .btn-success {{ background: #27ae60; color: white; }}
+                .btn-warning {{ background: #f39c12; color: white; }}
+                .status {{ padding: 5px 10px; border-radius: 15px; font-size: 12px; margin-left: 10px; }}
+                .status-online {{ background: #27ae60; color: white; }}
+                .status-offline {{ background: #e74c3c; color: white; }}
+                .logout-btn {{ background: #666; color: white; float: right; }}
+                .back-btn {{ background: #444; color: white; float: left; }}
+                .maintenance-alert {{ background: #e74c3c; color: white; padding: 15px; border-radius: 5px; margin-bottom: 20px; border-left: 5px solid #c0392b; }}
+                .tab {{ overflow: hidden; border: 1px solid #444; background-color: #2a2a2a; border-radius: 5px; margin-bottom: 20px; }}
+                .tab button {{ background-color: inherit; float: left; border: none; outline: none; cursor: pointer; padding: 14px 16px; transition: 0.3s; color: white; font-size: 16px; }}
+                .tab button:hover {{ background-color: #333; }}
+                .tab button.active {{ background-color: #ff9900; color: black; font-weight: bold; }}
+                .tabcontent {{ display: none; padding: 20px 0; }}
+                .applications-table {{ width: 100%; border-collapse: collapse; margin-top: 20px; background: #2a2a2a; border-radius: 10px; overflow: hidden; }}
+                .applications-table th, .applications-table td {{ padding: 15px; text-align: left; border-bottom: 1px solid #444; }}
+                .applications-table th {{ background: #333; color: #ff9900; font-weight: bold; }}
+                .applications-table tr:hover {{ background: #333; }}
+                .applications-table td {{ color: #e0e0e0; }}
+                .message-cell {{ max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+                .message-cell:hover {{ white-space: normal; overflow: visible; }}
+                .form-group {{ margin-bottom: 15px; }}
+                .form-group label {{ display: block; margin-bottom: 5px; color: #ff9900; font-weight: bold; }}
+                .form-group input, .form-group textarea, .form-group select {{ width: 100%; padding: 8px; background: #1a1a1a; border: 1px solid #444; border-radius: 4px; color: white; }}
+                .manual-blocks-list {{ margin-top: 20px; }}
+                .block-item {{ background: #2a2a2a; padding: 15px; margin-bottom: 10px; border-radius: 5px; border-left: 4px solid #e74c3c; }}
+                .block-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }}
+                .block-ip {{ font-weight: bold; color: #ff9900; }}
+                .block-reason {{ color: #cccccc; }}
+                .block-meta {{ font-size: 12px; color: #999; }}
+                .preview-image {{ width: 180px; height: 120px; object-fit: cover; border: 1px solid #555; border-radius: 6px; }}
+                .metric-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }}
+                .metric-box {{ background: #1f1f1f; border: 1px solid #3a3a3a; border-radius: 8px; padding: 12px; }}
+                .metric-box h4 {{ margin: 0 0 8px; color: #ff9900; }}
+                .metric-canvas {{ width: 100%; height: 140px; background: #151515; border: 1px solid #333; border-radius: 6px; }}
             </style>
         </head>
         <body>
@@ -1779,41 +2196,44 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
                     <a href="/admin/logout" class="btn logout-btn">Выйти</a>
                     <div style="clear: both;"></div>
                     <h1>Панель управления кланом BENZ</h1>
-                    <p>Мониторинг статистики и управление системой</p>
+                    <p>Вы вошли как: <strong>{current_admin}</strong> {'(Главный администратор)' if is_super_admin else '(Администратор)'}</p>
                 </div>
 
-                """ + ("""
-                <div class="maintenance-alert">
-                    <strong>⚠️ ВНИМАНИЕ:</strong> Режим технического обслуживания ВКЛЮЧЕН. Все пользователи видят страницу обслуживания.
-                </div>
-                """ if MAINTENANCE_MODE else "") + """
+                {('<div class="maintenance-alert"><strong>⚠️ ВНИМАНИЕ:</strong> Режим технического обслуживания ВКЛЮЧЕН. Все пользователи видят страницу обслуживания.</div>' if MAINTENANCE_MODE else '')}
 
                 <div class="tab">
                     <button class="tablinks active" onclick="openTab(event, 'Dashboard')">Дашборд</button>
                     <button class="tablinks" onclick="openTab(event, 'Applications')">Заявки</button>
                     <button class="tablinks" onclick="openTab(event, 'IPBlocks')">Блокировка IP</button>
+                    <button class="tablinks" onclick="openTab(event, 'Media')">Галерея</button>
+                    {'<button class="tablinks" onclick="openTab(event, &quot;SuperAdmin&quot;)">Главный админ</button>' if is_super_admin else ''}
                     <button class="tablinks" onclick="openTab(event, 'Maintenance')">Тех. обслуживание</button>
                 </div>
 
                 <div id="Dashboard" class="tabcontent" style="display: block;">
-                    <div class="stats-grid" id="statsGrid">
-                        <!-- Статистика будет загружена через JavaScript -->
-                    </div>
-
+                    <div class="stats-grid" id="statsGrid"></div>
                     <div class="control-panel">
-                        <h2>Статус сервисов</h2>
-                        <div>
-                            <span id="serverStatus" class="status status-online">Сервер: Запущен</span>
-                            <span class="status """ + maintenance_class + """">Обслуживание: """ + maintenance_status + """</span>
+                        <h2>Статус сервера</h2>
+                        <div id="serverStatusPanel">Загрузка...</div>
+                    </div>
+                    <div class="control-panel">
+                        <h2>График ролей</h2>
+                        <div id="rolesChart" class="chart-wrap">Загрузка...</div>
+                    </div>
+                    <div class="control-panel">
+                        <h2>Нагрузка системы и инфо</h2>
+                        <div id="systemInfoPanel">Загрузка...</div>
+                        <div class="metric-grid" style="margin-top:10px;">
+                            <div class="metric-box"><h4>CPU % (load avg)</h4><canvas id="cpuCanvas" class="metric-canvas" width="420" height="140"></canvas></div>
+                            <div class="metric-box"><h4>RAM %</h4><canvas id="memCanvas" class="metric-canvas" width="420" height="140"></canvas></div>
+                            <div class="metric-box"><h4>Disk %</h4><canvas id="diskCanvas" class="metric-canvas" width="420" height="140"></canvas></div>
                         </div>
                     </div>
                 </div>
 
                 <div id="Applications" class="tabcontent">
                     <h2>Заявки на вступление</h2>
-                    <div id="applicationsList">
-                        <!-- Заявки будут загружены через JavaScript -->
-                    </div>
+                    <div id="applicationsList"></div>
                 </div>
 
                 <div id="IPBlocks" class="tabcontent">
@@ -1842,288 +2262,271 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
                             <button type="submit" class="btn btn-danger">Заблокировать IP</button>
                         </form>
                     </div>
-
                     <div class="manual-blocks-list">
                         <h3>Активные блокировки</h3>
-                        <div id="manualBlocksList">
-                            <!-- Список блокировок будет загружен через JavaScript -->
-                        </div>
+                        <div id="manualBlocksList"></div>
                     </div>
                 </div>
 
+                <div id="Media" class="tabcontent">
+                    <h2>Управление галереей</h2>
+                    <div class="control-panel">
+                        <form id="addImageForm">
+                            <div class="form-group">
+                                <label for="image_url">Ссылка на фото:</label>
+                                <input type="url" id="image_url" required placeholder="https://...">
+                            </div>
+                            <button type="submit" class="btn btn-primary">Добавить фото</button>
+                        </form>
+                        <hr style="border-color:#444; margin:18px 0;">
+                        <form id="uploadImageForm" enctype="multipart/form-data">
+                            <div class="form-group">
+                                <label for="image_file">Загрузить файл (.jpg, .png, .webp, .gif):</label>
+                                <input type="file" id="image_file" name="image_file" accept=".jpg,.jpeg,.png,.webp,.gif,image/*" required>
+                            </div>
+                            <button type="submit" class="btn btn-success">Загрузить файл</button>
+                        </form>
+                        <p>{'Главный админ добавляет фото сразу на главный экран.' if is_super_admin else 'Ваши фото отправляются на модерацию главному админу.'}</p>
+                    </div>
+                    <div id="pendingGalleryWrap" class="control-panel" style="display:{'block' if is_super_admin else 'none'};">
+                        <h3>Фото на модерации</h3>
+                        <div id="pendingGalleryList"></div>
+                    </div>
+                </div>
+
+                {'<div id="SuperAdmin" class="tabcontent"><h2>Управление администраторами</h2><div class="control-panel"><form id="addAdminForm"><div class="form-group"><label for="new_admin_username">Логин нового админа:</label><input id="new_admin_username" required></div><div class="form-group"><label for="new_admin_password">Пароль нового админа:</label><input id="new_admin_password" type="password" required></div><button type="submit" class="btn btn-success">Добавить администратора</button></form></div></div>' if is_super_admin else ''}
+
                 <div id="Maintenance" class="tabcontent">
                     <h2>Управление техническим обслуживанием</h2>
-
                     <div class="control-panel">
                         <h3>Текущий статус</h3>
-                        <p>Режим технического обслуживания: <span class="status """ + maintenance_class + """">""" + maintenance_status + """</span></p>
-                        <p>В этом режиме все посетители сайта (кроме администраторов) будут видеть страницу технического обслуживания.</p>
-
-                        <div style="margin-top: 20px;">
-                            """ + ("""
-                            <button class="btn btn-success" onclick="toggleMaintenanceMode(false)">
-                                🟢 Выключить режим обслуживания
-                            </button>
-                            <p style="margin-top: 10px; color: #27ae60;"><strong>Сайт снова будет доступен для всех пользователей</strong></p>
-                            """ if MAINTENANCE_MODE else """
-                            <button class="btn btn-warning" onclick="toggleMaintenanceMode(true)">
-                                🔴 Включить режим обслуживания
-                            </button>
-                            <p style="margin-top: 10px; color: #e74c3c;"><strong>Все пользователи будут перенаправлены на страницу обслуживания</strong></p>
-                            """) + """
-                        </div>
-                    </div>
-
-                    <div class="control-panel">
-                        <h3>Информация о режиме обслуживания</h3>
-                        <ul>
-                            <li>Администраторы всегда имеют доступ к сайту и админ-панели</li>
-                            <li>Обычные пользователи видят страницу технического обслуживания</li>
-                            <li>Форма подачи заявок временно недоступна</li>
-                            <li>API endpoints продолжают работать для администраторов</li>
-                        </ul>
+                        <p>Режим технического обслуживания: <span class="{maintenance_class}">{maintenance_status}</span></p>
+                        <button class="btn btn-warning" onclick="toggleMaintenanceMode(true)">Включить режим обслуживания</button>
+                        <button class="btn btn-success" onclick="toggleMaintenanceMode(false)">Выключить режим обслуживания</button>
                     </div>
                 </div>
             </div>
 
             <script>
-                function openTab(evt, tabName) {
-                    var i, tabcontent, tablinks;
-                    tabcontent = document.getElementsByClassName("tabcontent");
-                    for (i = 0; i < tabcontent.length; i++) {
-                        tabcontent[i].style.display = "none";
-                    }
-                    tablinks = document.getElementsByClassName("tablinks");
-                    for (i = 0; i < tablinks.length; i++) {
-                        tablinks[i].className = tablinks[i].className.replace(" active", "");
-                    }
-                    document.getElementById(tabName).style.display = "block";
-                    evt.currentTarget.className += " active";
+                const metricHistory = {{ cpu: [], mem: [], disk: [] }};
 
-                    if (tabName === 'Applications') {
-                        loadApplications();
-                    } else if (tabName === 'IPBlocks') {
-                        loadManualBlocks();
-                    }
-                }
+                function openTab(evt, tabName) {{
+                    const tabcontent = document.getElementsByClassName('tabcontent');
+                    for (let i = 0; i < tabcontent.length; i++) tabcontent[i].style.display = 'none';
+                    const tablinks = document.getElementsByClassName('tablinks');
+                    for (let i = 0; i < tablinks.length; i++) tablinks[i].className = tablinks[i].className.replace(' active', '');
+                    document.getElementById(tabName).style.display = 'block';
+                    evt.currentTarget.className += ' active';
 
-                function updateStats() {
-                    fetch('/admin/api/stats')
-                        .then(response => response.json())
-                        .then(data => {
-                            document.getElementById('statsGrid').innerHTML = `
-                                <div class="stat-card">
-                                    <h3>📊 Общая статистика</h3>
-                                    <p style="font-size: 24px; font-weight: bold; color: #ff9900;">${data.applications.total}</p>
-                                    <p>Всего заявок</p>
-                                    <div style="border-top: 1px solid #444; margin: 10px 0; padding-top: 10px;">
-                                        <p>Сегодня: ${data.applications.today}</p>
-                                        <p>За неделю: ${data.applications.week}</p>
-                                        <p>За 24 часа: ${data.applications.daily}</p>
-                                        <p>За час: ${data.applications.hour}</p>
-                                    </div>
-                                </div>
+                    if (tabName === 'Applications') loadApplications();
+                    if (tabName === 'IPBlocks') loadManualBlocks();
+                    if (tabName === 'Media') loadPendingGallery();
+                }}
 
-                                <div class="stat-card">
-                                    <h3>👥 Статистика по ролям</h3>
-                                    <div style="max-height: 200px; overflow-y: auto;">
-                                        ${Object.entries(data.applications.roles).map(([role, count]) => `
-                                            <p><strong>${role}:</strong> ${count}</p>
-                                        `).join('')}
-                                    </div>
-                                    <div style="border-top: 1px solid #444; margin: 10px 0; padding-top: 10px;">
-                                        <p><strong>Популярная роль:</strong> ${data.applications.popular_role}</p>
-                                        <p><strong>Средние часы:</strong> ${data.applications.avg_playtime}</p>
-                                    </div>
-                                </div>
+                function renderRoleChart(roles) {{
+                    const chart = document.getElementById('rolesChart');
+                    const entries = Object.entries(roles || {{}});
+                    if (!entries.length) {{
+                        chart.innerHTML = '<p>Пока нет данных по ролям.</p>';
+                        return;
+                    }}
+                    const max = Math.max(...entries.map(e => e[1]));
+                    chart.innerHTML = entries.map(([role, count]) => `
+                        <div class="chart-row">
+                            <div class="chart-label">${{role}} — ${{count}}</div>
+                            <div class="chart-bar-bg"><div class="chart-bar" style="width:${{Math.max(8, (count / max) * 100)}}%"></div></div>
+                        </div>
+                    `).join('');
+                }}
 
-                                <div class="stat-card">
-                                    <h3>🌐 Посещения</h3>
-                                    <p style="font-size: 24px; font-weight: bold; color: #ff9900;">${data.visits.total_visits}</p>
-                                    <p>Всего посещений</p>
-                                    <div style="border-top: 1px solid #444; margin: 10px 0; padding-top: 10px;">
-                                        <p>Уникальных: ${data.visits.unique_visitors}</p>
-                                        <p>Сегодня: ${data.visits.today_visits}</p>
-                                    </div>
-                                </div>
+                function updateServerStatus() {{
+                    fetch('/admin/api/server-status').then(r => r.json()).then(data => {{
+                        const uptimeMinutes = Math.floor(data.uptime_seconds / 60);
+                        const sys = data.system_info || {{}};
+                        document.getElementById('serverStatusPanel').innerHTML = `
+                            <span class="status status-online">Сервер: Онлайн</span>
+                            <span class="status ${{data.maintenance ? 'status-offline' : 'status-online'}}">Обслуживание: ${{data.maintenance ? 'ВКЛ' : 'ВЫКЛ'}}</span>
+                            <p>Порт: <strong>${{data.port}}</strong> | Аптайм: <strong>${{uptimeMinutes}} мин</strong> | Активных админ-сессий: <strong>${{data.active_sessions}}</strong></p>
+                            <p>Хост: <strong>${{sys.hostname || '-'}}</strong> | CPU ядер: <strong>${{sys.cpu_count || '-'}}</strong> | Python: <strong>${{sys.python_version || '-'}}</strong></p>
+                        `;
+                    }});
+                }}
 
-                                <div class="stat-card">
-                                    <h3>⚙️ Система</h3>
-                                    <p><strong>Сервер:</strong> <span class="status status-online">${data.services.server}</span></p>
-                                    <p><strong>Порт сервера:</strong> ${data.services.server_port}</p>
-                                    <p><strong>База данных:</strong> <span class="status status-online">${data.services.database}</span></p>
-                                    <p><strong>Активные сессии:</strong> ${data.system.active_sessions}</p>
-                                    <p><strong>Обновлено:</strong> ${data.system.timestamp}</p>
-                                </div>
-                            `;
+                function drawMetric(canvasId, points, color) {{
+                    const canvas = document.getElementById(canvasId);
+                    if (!canvas) return;
+                    const ctx = canvas.getContext('2d');
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-                            document.getElementById('serverStatus').className = 'status status-online';
-                            document.getElementById('serverStatus').textContent = 'Сервер: Запущен';
-                        });
-                }
+                    ctx.strokeStyle = '#2d2d2d';
+                    ctx.lineWidth = 1;
+                    for (let i = 0; i <= 5; i++) {{
+                        const y = (canvas.height / 5) * i;
+                        ctx.beginPath();
+                        ctx.moveTo(0, y);
+                        ctx.lineTo(canvas.width, y);
+                        ctx.stroke();
+                    }}
 
-                function loadApplications() {
-                    fetch('/admin/api/applications')
-                        .then(response => response.json())
-                        .then(data => {
-                            const applicationsList = document.getElementById('applicationsList');
-                            if (data.applications.length === 0) {
-                                applicationsList.innerHTML = '<div class="stat-card"><p>Нет заявок</p></div>';
-                                return;
-                            }
+                    if (!points.length) return;
+                    const maxPoints = 40;
+                    const visible = points.slice(-maxPoints);
+                    const stepX = canvas.width / Math.max(1, visible.length - 1);
 
-                            let html = `
-                                <table class="applications-table">
-                                    <thead>
-                                        <tr>
-                                            <th>ID</th>
-                                            <th>Никнейм</th>
-                                            <th>Steam ID</th>
-                                            <th>Часы</th>
-                                            <th>Discord</th>
-                                            <th>Роль</th>
-                                            <th>Сообщение</th>
-                                            <th>IP</th>
-                                            <th>Дата</th>
-                                            <th>Статус</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                            `;
+                    ctx.strokeStyle = color;
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    visible.forEach((value, idx) => {{
+                        const x = idx * stepX;
+                        const y = canvas.height - (Math.max(0, Math.min(100, value)) / 100) * canvas.height;
+                        if (idx === 0) ctx.moveTo(x, y);
+                        else ctx.lineTo(x, y);
+                    }});
+                    ctx.stroke();
+                }}
 
-                            data.applications.forEach(app => {
-                                html += `
-                                    <tr>
-                                        <td>${app.id}</td>
-                                        <td><strong>${app.nickname}</strong></td>
-                                        <td>${app.steam_id}</td>
-                                        <td>${app.playtime}</td>
-                                        <td>${app.discord}</td>
-                                        <td>${app.role}</td>
-                                        <td class="message-cell" title="${app.message}">${app.message}</td>
-                                        <td>${app.ip_address}</td>
-                                        <td>${new Date(app.timestamp).toLocaleString('ru-RU')}</td>
-                                        <td><span class="status ${app.status === 'new' ? 'status-online' : 'status-offline'}">${app.status}</span></td>
-                                    </tr>
-                                `;
-                            });
+                function updateSystemMetrics() {{
+                    fetch('/admin/api/system-metrics').then(r => r.json()).then(data => {{
+                        const m = data.metrics || {{}};
+                        const sys = data.system_info || {{}};
+                        const cpu = Number(m.cpu_usage_percent || 0);
+                        const mem = Number((m.memory || {{}}).usage_percent || 0);
+                        const disk = Number((m.disk || {{}}).usage_percent || 0);
 
-                            html += '</tbody></table>';
-                            applicationsList.innerHTML = html;
-                        });
-                }
+                        metricHistory.cpu.push(cpu);
+                        metricHistory.mem.push(mem);
+                        metricHistory.disk.push(disk);
 
-                function loadManualBlocks() {
-                    fetch('/admin/api/manual-blocks')
-                        .then(response => response.json())
-                        .then(data => {
-                            const blocksList = document.getElementById('manualBlocksList');
-                            if (data.blocks.length === 0) {
-                                blocksList.innerHTML = '<div class="stat-card"><p>Нет активных блокировок</p></div>';
-                                return;
-                            }
+                        drawMetric('cpuCanvas', metricHistory.cpu, '#ff9900');
+                        drawMetric('memCanvas', metricHistory.mem, '#2ecc71');
+                        drawMetric('diskCanvas', metricHistory.disk, '#3498db');
 
-                            let html = '';
-                            data.blocks.forEach(block => {
-                                const blockTime = new Date(block.block_time).toLocaleString('ru-RU');
-                                const expiresInfo = block.expires_at ? 
-                                    `Истекает: ${new Date(block.expires_at).toLocaleString('ru-RU')}` : 
-                                    'Блокировка постоянная';
+                        const load = m.load_avg || {{}};
+                        const memInfo = m.memory || {{}};
+                        const diskInfo = m.disk || {{}};
+                        document.getElementById('systemInfoPanel').innerHTML = `
+                            <p><strong>Платформа:</strong> ${{sys.platform || '-'}} | <strong>Хост:</strong> ${{sys.hostname || '-'}} | <strong>Обновлено:</strong> ${{m.timestamp || '-'}}</p>
+                            <p><strong>CPU:</strong> ${{cpu.toFixed(2)}}% (load1=${{load.one_min ?? '-'}}, load5=${{load.five_min ?? '-'}}, load15=${{load.fifteen_min ?? '-'}})</p>
+                            <p><strong>RAM:</strong> ${{mem.toFixed(2)}}% (исп.: ${{memInfo.used_mb || 0}} MB / ${{memInfo.total_mb || 0}} MB)</p>
+                            <p><strong>Disk:</strong> ${{disk.toFixed(2)}}% (исп.: ${{diskInfo.used_mb || 0}} MB / ${{diskInfo.total_mb || 0}} MB)</p>
+                        `;
+                    }});
+                }}
 
-                                html += `
-                                    <div class="block-item">
-                                        <div class="block-header">
-                                            <span class="block-ip">${block.ip_address}</span>
-                                            <button class="btn btn-success" onclick="unblockIP('${block.ip_address}')">Разблокировать</button>
-                                        </div>
-                                        <div class="block-reason">${block.reason || 'Причина не указана'}</div>
-                                        <div class="block-meta">
-                                            Заблокирован: ${blockTime} | ${expiresInfo} | Администратор: ${block.blocked_by}
-                                            ${block.is_expired ? ' <span style="color: #ff9900;">(Истекла)</span>' : ''}
-                                        </div>
-                                    </div>
-                                `;
-                            });
+                function updateStats() {{
+                    fetch('/admin/api/stats').then(r => r.json()).then(data => {{
+                        const statsGrid = document.getElementById('statsGrid');
+                        statsGrid.innerHTML = `
+                            <div class="stat-card"><h3>Заявки всего</h3><p style="font-size:28px">${{data.applications.total}}</p><p>Сегодня: ${{data.applications.today}}</p><p>За неделю: ${{data.applications.week}}</p></div>
+                            <div class="stat-card"><h3>Посещения</h3><p style="font-size:28px">${{data.visits.total_visits}}</p><p>Уникальные: ${{data.visits.unique_visitors}}</p></div>
+                            <div class="stat-card"><h3>Система</h3><p>Сервер: ${{data.services.server}}</p><p>БД: ${{data.services.database}}</p><p>Обновлено: ${{data.system.timestamp}}</p></div>
+                        `;
+                        renderRoleChart(data.applications.roles);
+                    }});
+                    updateServerStatus();
+                    updateSystemMetrics();
+                }}
 
-                            blocksList.innerHTML = html;
-                        });
-                }
+                function loadApplications() {{
+                    fetch('/admin/api/applications').then(r => r.json()).then(data => {{
+                        const list = document.getElementById('applicationsList');
+                        if (!data.applications.length) {{ list.innerHTML = '<div class="stat-card">Нет заявок</div>'; return; }}
+                        let html = '<table class="applications-table"><tr><th>ID</th><th>Ник</th><th>Steam</th><th>Часы</th><th>Discord</th><th>Роль</th><th>Сообщение</th><th>Дата</th></tr>';
+                        data.applications.forEach(app => {{
+                            html += `<tr><td>${{app.id}}</td><td>${{app.nickname}}</td><td>${{app.steam_id}}</td><td>${{app.playtime}}</td><td>${{app.discord}}</td><td>${{app.role}}</td><td class="message-cell">${{app.message}}</td><td>${{app.timestamp}}</td></tr>`;
+                        }});
+                        html += '</table>';
+                        list.innerHTML = html;
+                    }});
+                }}
 
-                function unblockIP(ipAddress) {
-                    if (confirm(`Вы уверены, что хотите разблокировать IP ${ipAddress}?`)) {
-                        fetch('/admin/api/manual-blocks/remove', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                            },
-                            body: JSON.stringify({ ip_address: ipAddress })
-                        })
-                        .then(response => response.json())
-                        .then(data => {
-                            if (data.success) {
-                                alert('IP разблокирован');
-                                loadManualBlocks();
-                            } else {
-                                alert('Ошибка при разблокировке IP');
-                            }
-                        });
-                    }
-                }
+                function loadManualBlocks() {{
+                    fetch('/admin/api/manual-blocks').then(r => r.json()).then(data => {{
+                        const blocksList = document.getElementById('manualBlocksList');
+                        if (data.blocks.length === 0) {{ blocksList.innerHTML = '<div class="stat-card"><p>Нет активных блокировок</p></div>'; return; }}
+                        let html = '';
+                        data.blocks.forEach(block => {{
+                            html += `<div class="block-item"><div class="block-header"><span class="block-ip">${{block.ip_address}}</span><button class="btn btn-success" onclick="unblockIP('${{block.ip_address}}')">Разблокировать</button></div><div class="block-reason">${{block.reason || 'Причина не указана'}}</div><div class="block-meta">Админ: ${{block.blocked_by}}</div></div>`;
+                        }});
+                        blocksList.innerHTML = html;
+                    }});
+                }}
 
-                function toggleMaintenanceMode(enable) {
-                    const action = enable ? 'включить' : 'выключить';
-                    if (confirm(`Вы уверены, что хотите ${action} режим технического обслуживания?`)) {
-                        fetch('/admin/api/maintenance/toggle', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                            },
-                            body: JSON.stringify({ enabled: enable })
-                        })
-                        .then(response => response.json())
-                        .then(data => {
-                            if (data.success) {
-                                alert(`Режим обслуживания ${enable ? 'включен' : 'выключен'}`);
-                                location.reload();
-                            } else {
-                                alert('Ошибка при изменении режима обслуживания');
-                            }
-                        })
-                        .catch(error => {
-                            console.error('Error:', error);
-                            alert('Ошибка при изменении режима обслуживания');
-                        });
-                    }
-                }
+                function unblockIP(ipAddress) {{
+                    if (!confirm(`Разблокировать IP ${{ipAddress}}?`)) return;
+                    fetch('/admin/api/manual-blocks/remove', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify({{ ip_address: ipAddress }}) }})
+                    .then(r => r.json()).then(data => {{
+                        if (data.success) loadManualBlocks(); else alert('Ошибка разблокировки');
+                    }});
+                }}
 
-                // Обработчик формы блокировки IP
-                document.getElementById('blockIpForm').addEventListener('submit', function(e) {
+                function toggleMaintenanceMode(enable) {{
+                    fetch('/admin/api/maintenance/toggle', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify({{ enabled: enable }}) }})
+                    .then(r => r.json()).then(data => {{
+                        if (data.success) location.reload(); else alert('Ошибка изменения режима');
+                    }});
+                }}
+
+                function loadPendingGallery() {{
+                    const list = document.getElementById('pendingGalleryList');
+                    if (!list) return;
+                    fetch('/admin/api/gallery/pending').then(r => r.json()).then(data => {{
+                        if (!data.items.length) {{ list.innerHTML = '<p>Нет фото на модерации.</p>'; return; }}
+                        list.innerHTML = data.items.map(item => `
+                            <div class="block-item">
+                                <div class="block-header"><span class="block-ip">ID: ${{item.id}}</span><button class="btn btn-success" onclick="approvePhoto(${{item.id}})">Одобрить</button></div>
+                                <div class="block-reason">Отправил: ${{item.submitted_by}}</div>
+                                <img class="preview-image" src="${{item.image_url}}" alt="preview">
+                                <div><a href="${{item.image_url}}" target="_blank" style="color:#ff9900">${{item.image_url}}</a></div>
+                            </div>
+                        `).join('');
+                    }});
+                }}
+
+                function approvePhoto(submissionId) {{
+                    fetch('/admin/api/gallery/approve', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify({{ submission_id: submissionId }}) }})
+                    .then(r => r.json()).then(data => {{
+                        alert(data.message);
+                        if (data.success) loadPendingGallery();
+                    }});
+                }}
+
+                document.getElementById('blockIpForm').addEventListener('submit', function(e) {{
                     e.preventDefault();
+                    const formData = {{ ip_address: ip_address.value, block_reason: block_reason.value, expires_hours: expires_hours.value }};
+                    fetch('/admin/api/manual-blocks/add', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify(formData) }})
+                    .then(r => r.json()).then(data => {{
+                        if (data.success) {{ this.reset(); loadManualBlocks(); }} else alert(data.message || 'Ошибка блокировки');
+                    }});
+                }});
 
-                    const formData = {
-                        ip_address: document.getElementById('ip_address').value,
-                        block_reason: document.getElementById('block_reason').value,
-                        expires_hours: document.getElementById('expires_hours').value
-                    };
+                document.getElementById('addImageForm').addEventListener('submit', function(e) {{
+                    e.preventDefault();
+                    fetch('/admin/api/gallery/add', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify({{ image_url: image_url.value }}) }})
+                    .then(r => r.json()).then(data => {{
+                        alert(data.message);
+                        if (data.success) this.reset();
+                    }});
+                }});
 
-                    fetch('/admin/api/manual-blocks/add', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify(formData)
-                    })
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.success) {
-                            alert('IP успешно заблокирован');
-                            document.getElementById('blockIpForm').reset();
-                            loadManualBlocks();
-                        } else {
-                            alert('Ошибка при блокировке IP: ' + data.message);
-                        }
-                    });
-                });
+                document.getElementById('uploadImageForm').addEventListener('submit', function(e) {{
+                    e.preventDefault();
+                    const formData = new FormData(this);
+                    fetch('/admin/api/gallery/upload', {{ method: 'POST', body: formData }})
+                    .then(r => r.json()).then(data => {{
+                        alert(data.message || 'Готово');
+                        if (data.success) this.reset();
+                    }});
+                }});
+
+                const addAdminForm = document.getElementById('addAdminForm');
+                if (addAdminForm) {{
+                    addAdminForm.addEventListener('submit', function(e) {{
+                        e.preventDefault();
+                        fetch('/admin/api/admins/add', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify({{ username: new_admin_username.value, password: new_admin_password.value }}) }})
+                        .then(r => r.json()).then(data => alert(data.message));
+                    }});
+                }}
 
                 setInterval(updateStats, 5000);
                 updateStats();
@@ -2238,6 +2641,10 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
                 </div>
                 <form id="loginForm">
                     <div class="form-group">
+                        <label for="username">Логин:</label>
+                        <input type="text" id="username" name="username" value="main_admin" required>
+                    </div>
+                    <div class="form-group">
                         <label for="password">Пароль:</label>
                         <input type="password" id="password" name="password" required>
                     </div>
@@ -2252,6 +2659,7 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
             <script>
                 document.getElementById('loginForm').addEventListener('submit', async function(e) {
                     e.preventDefault();
+                    const username = document.getElementById('username').value;
                     const password = document.getElementById('password').value;
 
                     const response = await fetch('/admin/api/login', {
@@ -2259,7 +2667,7 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
                         headers: {
                             'Content-Type': 'application/json',
                         },
-                        body: JSON.stringify({ password: password })
+                        body: JSON.stringify({ username: username, password: password })
                     });
 
                     if (response.ok) {
@@ -2284,10 +2692,11 @@ def run_server():
     global server_httpd
     try:
         server_address = ('', SERVER_PORT)
-        server_httpd = HTTPServer(server_address, ClanRequestHandler)
+        server_httpd = ThreadingHTTPServer(server_address, ClanRequestHandler)
         logger.info(f"Сервер запущен на порту {SERVER_PORT}")
         logger.info(f"Админка доступна по адресу: http://localhost:{SERVER_PORT}/admin")
-        logger.info(f"Пароль для входа в админку: {MANAGE_PASSWORD}")
+        logger.info(f"Главный админ: {MAIN_ADMIN_USERNAME}")
+        logger.info(f"Пароль главного админа: {MAIN_ADMIN_PASSWORD}")
         logger.info(f"Режим обслуживания: {'ВКЛЮЧЕН' if MAINTENANCE_MODE else 'ВЫКЛЮЧЕН'}")
         server_httpd.serve_forever()
     except Exception as e:
@@ -2309,7 +2718,8 @@ def main():
 
     print("Сервер клана запущен")
     print(f"Админка доступна по адресу: http://localhost:{SERVER_PORT}/admin")
-    print(f"Пароль для входа: {MANAGE_PASSWORD}")
+    print(f"Главный админ: {MAIN_ADMIN_USERNAME}")
+    print(f"Пароль главного админа: {MAIN_ADMIN_PASSWORD}")
     print(f"Режим обслуживания: {'ВКЛЮЧЕН' if MAINTENANCE_MODE else 'ВЫКЛЮЧЕН'}")
     print("\nДля остановки нажмите Ctrl+C")
     print("=" * 50)

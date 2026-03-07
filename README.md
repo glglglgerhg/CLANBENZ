@@ -38,3 +38,10 @@ SyntaxError: expected 'except' or 'finally' block
    ```bash
    python SITEBENZ.py
    ```
+
+
+## Деплой на Ubuntu 22
+
+Подробная пошаговая инструкция находится в `DEPLOY.md`.
+
+SSL/домен и автообновление сертификатов: `DEPLOY_SSL.md`.

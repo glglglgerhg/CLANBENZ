@@ -1538,6 +1538,88 @@ class ClanRequestHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def handle_application(self):
+        """Обработка отправки заявки в клан."""
+        try:
+            content_length = int(self.headers.get('Content-Length', '0'))
+            post_data = self.rfile.read(content_length) if content_length > 0 else b''
+
+            content_type = (self.headers.get('Content-Type') or '').lower()
+            if 'application/json' in content_type:
+                data = json.loads(post_data.decode('utf-8')) if post_data else {}
+            else:
+                form = parse_qs(post_data.decode('utf-8'))
+                data = {k: (v[0] if isinstance(v, list) and v else '') for k, v in form.items()}
+
+            application_data = {
+                'nickname': str(data.get('nickname') or '').strip(),
+                'steamId': str(data.get('steamId') or data.get('steam_id') or '').strip(),
+                'playtime': str(data.get('playtime') or '').strip(),
+                'discord': str(data.get('discord') or '').strip(),
+                'role': str(data.get('role') or '').strip(),
+                'message': str(data.get('message') or '').strip(),
+                'ip': self.client_address[0]
+            }
+
+            required = ('nickname', 'steamId', 'playtime', 'discord', 'role', 'message')
+            missing = [field for field in required if not application_data[field]]
+            if missing:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'success': False,
+                    'message': 'Заполните все обязательные поля'
+                }).encode('utf-8'))
+                return
+
+            try:
+                playtime = int(application_data['playtime'])
+            except ValueError:
+                playtime = 0
+
+            if playtime < 1500:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'success': False,
+                    'message': 'Минимум 1500 часов в игре'
+                }).encode('utf-8'))
+                return
+
+            if not can_submit_application(application_data['ip']):
+                self.send_response(429)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'success': False,
+                    'message': 'Можно отправлять не чаще 1 раза в час'
+                }).encode('utf-8'))
+                return
+
+            application_id = save_application(application_data)
+            if application_id is None:
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'success': False,
+                    'message': 'Не удалось сохранить заявку'
+                }).encode('utf-8'))
+                return
+
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                'success': True,
+                'application_id': application_id
+            }).encode('utf-8'))
+        except Exception as e:
+            logger.error(f"Ошибка обработки заявки: {e}")
+            self.send_error(500)
+
     def handle_admin_request(self, path):
         """Обработка запросов админки"""
         if path == '/admin' or path == '/admin/':
@@ -2701,8 +2783,19 @@ def run_server():
         logger.info(f"Главный админ: {MAIN_ADMIN_USERNAME}")
         logger.info(f"Режим обслуживания: {'ВКЛЮЧЕН' if MAINTENANCE_MODE else 'ВЫКЛЮЧЕН'}")
         server_httpd.serve_forever()
+        return True
+    except OSError as e:
+        if getattr(e, 'errno', None) == 98:
+            logger.error(
+                f"Порт {SERVER_PORT} уже занят. Остановите другой процесс/службу и попробуйте снова "
+                f"(например: sudo lsof -i :{SERVER_PORT})"
+            )
+        else:
+            logger.error(f"Ошибка запуска сервера: {e}")
+        return False
     except Exception as e:
         logger.error(f"Ошибка запуска сервера: {e}")
+        return False
 
 
 # ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
@@ -2718,15 +2811,17 @@ def main():
     # Загрузка режима обслуживания
     load_maintenance_mode()
 
-    print("Сервер клана запущен")
-    print(f"Админка доступна по адресу: http://localhost:{SERVER_PORT}/admin")
+    print("Сервер клана запускается...")
+    print(f"Админка: http://localhost:{SERVER_PORT}/admin")
     print(f"Главный админ: {MAIN_ADMIN_USERNAME}")
     print(f"Режим обслуживания: {'ВКЛЮЧЕН' if MAINTENANCE_MODE else 'ВЫКЛЮЧЕН'}")
     print("\nДля остановки нажмите Ctrl+C")
     print("=" * 50)
 
     # Запуск сервера (блокирующий вызов)
-    run_server()
+    started = run_server()
+    if not started:
+        print(f"Не удалось запустить сервер на порту {SERVER_PORT}. Проверьте занят ли порт.")
 
 
 if __name__ == '__main__':

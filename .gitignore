@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db-shm
+*.db-wal
+*.db
+manage.log
+maintenance_mode.json
+static/uploads/
